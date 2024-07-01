@@ -239,8 +239,8 @@ int main(int argc, char* argv[]) {
     CHECK_CUDA_ERROR(cudaEventCreate(&start));
     CHECK_CUDA_ERROR(cudaEventCreate(&stop));
     const size_t numRuns{4};
-    const int blocksPerGrid = (arraySizeElems + numThreadsInBlock - 1) / numThreadsInBlock;
-    const size_t sharedMemSize = sizeof(GrowingBuffer) * (32) + sizeof(int) * 32 + sizeof(Buffer);
+    // const int blocksPerGrid = (arraySizeElems + numThreadsInBlock - 1) / numThreadsInBlock;
+    const size_t sharedMemSize = sizeof(GrowingBuffer) * (32); // + sizeof(int) * 32 + sizeof(Buffer);
     float timeMs = 0.0f;
 
     if(printHeader){
@@ -264,7 +264,6 @@ int main(int argc, char* argv[]) {
             auto t = cudaGetLastError();
             CHECK_CUDA_ERROR(t);
         }
-        Vec<Buffer>* mallod = (Vec<Buffer>*) malloc (sizeof(Vec<Buffer>));
         Buffer* mallodb = (Buffer*) malloc (sizeof(Buffer));
 
         CHECK_CUDA_ERROR(cudaMemcpyFromSymbol(counters, deviceCounters, 4 * sizeof(int), 0, cudaMemcpyDeviceToHost));
@@ -275,7 +274,7 @@ int main(int argc, char* argv[]) {
             counters[(int)Counter::InitBufferMalloc]+counters[static_cast<int>(Counter::NextBufferMalloc)]+counters[static_cast<int>(Counter::VectorExpansionMalloc)],
             counters[static_cast<int>(Counter::InitBufferMalloc)], counters[static_cast<int>(Counter::VectorExpansionMalloc)], 
             counters[static_cast<int>(Counter::NextBufferMalloc)], counters[static_cast<int>(Counter::Free)], h_result->getValues().getLen());
-            
+        free(mallodb);  
     };
     // runMallocBench(processKernel<KernelType::Naive>, "Naive");
     #ifdef GALLATIN_ENABLED
@@ -285,7 +284,7 @@ int main(int argc, char* argv[]) {
     #endif
 
     int *d_count_array,*d_prefix_sum,*d_output;
-    int numThreads =  numBlocks* 1024;
+    int numThreads = numBlocks * numThreadsInBlock;
     int total_filtered_elements{0};
     int last_element{0};
 
@@ -298,7 +297,7 @@ int main(int argc, char* argv[]) {
         last_element = 0;
 
         cudaEventRecord(start, 0);
-        countFilter<<<numBlocks, 1024>>>(d_input_cols, numPredColumns,  d_count_array, arraySizeElems);
+        countFilter<<<numBlocks, numThreadsInBlock>>>(d_input_cols, numPredColumns,  d_count_array, arraySizeElems);
         cudaDeviceSynchronize();
         cudaMemcpy(&last_element, &d_count_array[numThreads - 1], sizeof(int), cudaMemcpyDeviceToHost);
  
@@ -307,7 +306,7 @@ int main(int argc, char* argv[]) {
         cudaMemcpy(&total_filtered_elements, &d_prefix_sum[numThreads - 1], sizeof(int), cudaMemcpyDeviceToHost);
         total_filtered_elements += last_element;
         cudaMalloc(&d_output, total_filtered_elements * sizeof(int));
-        filterKernel<<<numBlocks, 1024>>>(d_input_cols, numPredColumns, d_output, d_prefix_sum, arraySizeElems);
+        filterKernel<<<numBlocks, numThreadsInBlock>>>(d_input_cols, numPredColumns, d_output, d_prefix_sum, arraySizeElems);
         cudaDeviceSynchronize();
 
         cudaEventRecord(stop, 0);
