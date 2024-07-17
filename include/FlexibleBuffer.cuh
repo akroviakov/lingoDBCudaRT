@@ -5,8 +5,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <stdint.h>
-
-constexpr int typeSize=4;
+#include <stdio.h>
 
 enum class Counter{VectorExpansionMalloc = 0, NextBufferMalloc, InitBufferMalloc, Free};
 int counters[4];
@@ -14,36 +13,31 @@ __device__ int deviceCounters[4];
 
 struct Buffer {
     uint8_t* ptr;
-    int numElements;
+    int numElements{0};
     bool own{true};
 };
 
-// template<typename T>
-// struct Array {
-//     int count{0};
-//     int capacity{32 * 32};
-//     T staticPayLoad[32 * 32];
-//     __device__ void push_back(const T& elem){
-//         assert(count != capacity);
-//         staticPayLoad[count] = elem;
-//         count++;
-//     }
-//     // We start with 32 warps, each having a buffer vector.
-//     // Buffer vector is exponential, starts from 2^10, assume we can't have over 2^64 elements.
-//     // Then each buffer vector will at most containt 54 elements, each TB has 32 warps, so TB can have at most 32 = 1728 buffers.
-//     // We can allocate it in one peace, 16 * 1728 = 27648 bytes for buffers per TB.
+template<typename T, size_t Capacity>
+struct Array {
+    uint32_t size{0};
+    T staticPayLoad[Capacity];
+    __device__ Array(T* input, size_t size = Capacity){
+        memcpy(staticPayLoad, input, sizeof(T) * size);
+    }
+    __device__ void push_back(const T& elem){
+        assert(size != Capacity);
+        staticPayLoad[size++] = elem;
+    }
 
-//     __device__ T& back(){
-//         return staticPayLoad[count-1];
-//     }
-//     __device__ void merge(Array<T>& other){
-//         for(int i = 0; i < other.count; i++){
-//             push_back(other.staticPayLoad[i]);
-//         }
-//         other.count = 0;
-//         other.capacity = 0;
-//     }
-// };
+    __device__ T& back(){
+        return staticPayLoad[size-1];
+    }
+
+    __device__ __host__ T& operator[](uint32_t index) {
+        assert(index < size);
+        return staticPayLoad[index];
+    }
+};
 
 // class StaticBuffer {
 //     int totalLen;
@@ -139,11 +133,14 @@ struct Buffer {
 #endif
 
 __device__ __forceinline__ void* memAlloc(int numBytes){
+    void* result = nullptr;
     #ifdef GALLATIN_ENABLED
-    return gallatin::allocators::global_malloc(numBytes);
+    result = gallatin::allocators::global_malloc(numBytes);
     #else
-    return malloc(numBytes);
+    result = malloc(numBytes);
     #endif
+    assert(result);
+    return result;
 }
 
 __device__ __forceinline__ void freePtr(void* ptr){
@@ -172,6 +169,11 @@ struct Vec {
         count++;
     }
 
+    __device__ T& operator[](uint32_t index) {
+        assert(index < count);
+        return payLoad[index];
+    }
+
     __device__ T& back(){
         return payLoad[count-1];
     }
@@ -194,8 +196,9 @@ public:
     __device__ FlexibleBuffer(int initialCapacity, int typeSize, Buffer firstBuf);
 
     __device__ uint8_t* insert();
+    __device__ uint8_t* insertWarpLevel();
     __device__ uint8_t* prepareWriteFor(const int numElems);
-
+    
     __device__ void merge(FlexibleBuffer& other) {
         buffers.merge(other.buffers);
         totalLen += other.totalLen;
@@ -220,6 +223,21 @@ public:
     }
 
     __device__ ~FlexibleBuffer();
+
+    __device__ void print(void (*printEntry)(uint8_t*) = nullptr){
+        printf("--------------------FlexibleBuffer [%p]--------------------\n", this);
+        printf("totalLen=%d, currCapacity=%d, typeSize=%d, buffersLen=%d\n", totalLen, currCapacity, typeSize, buffers.count);
+        for(int i = 0; i < buffers.count; i++){
+            printf("-  Buffer %d has %d elements\n", i, buffers.payLoad[i].numElements);
+            if(printEntry){
+                for(int elIdx = 0; elIdx < buffers.payLoad[i].numElements; elIdx++){
+                    printEntry(&buffers.payLoad[i].ptr[elIdx*typeSize]);
+                    printf("\n");
+                }
+            }
+        }
+        printf("-----------------------------------------------------------\n");
+    }
 };
 
 
@@ -289,6 +307,28 @@ __device__ FlexibleBuffer::FlexibleBuffer(int initialCapacity, int typeSize, Buf
     buffers.push_back(firstBuf);
 }
 
+__device__ uint8_t* FlexibleBuffer::insertWarpLevel() {
+    const int threadIdxInWarp = threadIdx.x % warpSize;
+    // Match any threads that write to the same FlexiBleBuffer    
+    const int mask = __match_any_sync(__activemask(), (unsigned long long)this);
+    // Select a leader
+    const int leader = __ffs(mask) - 1;
+    const int warpOffset = __popc(mask & ((1 << threadIdxInWarp) - 1));
+    uint8_t* resPtr{nullptr};
+    if(threadIdxInWarp == leader){
+        const int numActiveThreads = __popc(mask);
+        if(buffers.count == 0 || (buffers.back().numElements + numActiveThreads) >= currCapacity){
+            nextBuffer();
+        }
+        totalLen += numActiveThreads;
+        resPtr = &buffers.back().ptr[typeSize * (buffers.back().numElements)];
+        buffers.back().numElements += numActiveThreads;
+    }
+    // get leader’s ptr
+    resPtr = reinterpret_cast<uint8_t*>(__shfl_sync(mask, (unsigned long long)resPtr, leader));    
+    return &resPtr[typeSize*warpOffset];
+}
+
 __device__ uint8_t* FlexibleBuffer::insert() {
     if (buffers.count == 0 || buffers.back().numElements == currCapacity) {
         nextBuffer();
@@ -300,7 +340,9 @@ __device__ uint8_t* FlexibleBuffer::insert() {
 }
 
 __device__ uint8_t* FlexibleBuffer::prepareWriteFor(const int numElems) {
+    // printf("[%p]buffers.count %d == 0  || buffers.back().numElements %d + numElems %d >=  currCapacity %d \n", &buffers.back(), buffers.count, buffers.back().numElements, numElems, currCapacity);
     if (buffers.count == 0 || buffers.back().numElements + numElems >= currCapacity) {
+        // printf("[%p]WOW buffers.count %d == 0  || buffers.back().numElements %d + numElems %d >=  currCapacity %d \n", &buffers.back(), buffers.count, buffers.back().numElements, numElems, currCapacity);
         nextBuffer();
     }
     totalLen += numElems;
