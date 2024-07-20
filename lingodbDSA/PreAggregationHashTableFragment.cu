@@ -75,7 +75,7 @@ __global__ void growingBufferFill(int** input, int numPredColumns, int size, Gro
     const int warpId = threadIdx.x / warp_size;
     extern __shared__ char sharedMem[];
     GrowingBuffer* warpBuffers = reinterpret_cast<GrowingBuffer*>(sharedMem);
-    if(globalTid == 0){
+    if(globalTid == 0){ // race condition: globalTid != 0 skips this, can skip the loop and appear in merge before globalTid==0 even initializes.
         acquire_lock(&globalLock);
         new(finalBuffer) GrowingBuffer(initialCapacity, typeSize, false);
         __threadfence();
@@ -144,11 +144,12 @@ __device__ void printEntry(uint8_t* entryPtr){
     printf("{key=%d,val=%d,hash=%llu,next=%p},", structPtr->key, structPtr->value, structPtr->hashValue, structPtr->next);
 }
 
-__global__ void printPreAggregationHashtable(PreAggregationHashtable* ht) {
+__global__ void printPreAggregationHashtable(PreAggregationHashtable* ht, bool printEmpty=false) {
     printf("---------------------PreAggregationHashtable [%p]-------------------------\n", ht);
     for(int p = 0; p < 64; p++){
         for(int i = 0; i < ht->ht[p].hashMask+1; i++){
             HashIndexedViewEntry* curr = reinterpret_cast<HashIndexedViewEntry*>(ht->ht[p].ht[i]);
+            if(!printEmpty && !curr){continue;}
             printf("[PARTITION %d, htEntryIdx=%d]", p, i);
             while(curr){
                 printf(", {ptr=%p, next=%p, KEY: %d, AGG: %d}", curr, curr->next, curr->key, curr->value);
@@ -159,6 +160,301 @@ __global__ void printPreAggregationHashtable(PreAggregationHashtable* ht) {
     }
     printf("------------------[END] PreAggregationHashtable [%p]----------------------\n", ht);
 
+}
+
+struct HIVEntry{
+    HashIndexedView::Entry* head{nullptr};
+    HashIndexedView::Entry* tail{nullptr};
+    int64_t writeOutPos{-1};
+    // size_t chainLength{0};
+};
+
+__device__ void atomicAppendSubList(HashIndexedView::Entry** globalHt, const size_t pos, 
+        HashIndexedView::Entry* subListHead, 
+        HashIndexedView::Entry* subListTail) {
+    HashIndexedView::Entry* currentHead = globalHt[pos];
+    HashIndexedView::Entry* old = currentHead;
+    do {
+        currentHead = old;
+        if(subListHead != subListTail){ // We set tail to head on the first write to head, if they do not match -> sub-list length > 1, need to adjust tail
+            subListTail->next = currentHead; 
+        } else // if subListHead is not different from tail -> sub-list length 1, only adjust head
+            subListHead->next = currentHead; 
+        subListHead = tag(subListHead, currentHead, subListHead->hashValue);
+        old = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[pos], (unsigned long long)currentHead, (unsigned long long)subListHead);
+    } while (old != currentHead);
+}
+
+__device__ __forceinline__ void atomicAppendSMEM(HIVEntry* globalHt, const size_t pos, HashIndexedView::Entry* newNode) {
+    HashIndexedView::Entry* currentHead = globalHt[pos].head;
+    HashIndexedView::Entry* old = currentHead;
+    do {
+        currentHead = old;
+        newNode->next = currentHead; 
+        newNode = tag(newNode, currentHead, newNode->hashValue);
+        old = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[pos].head, (unsigned long long)currentHead, (unsigned long long)newNode);
+    } while (old != currentHead);
+    if(!old) { // We executed the first write (meaning head was nullptr before): set tail to head. No other write to this head would update it anymore -> thread safe.
+        globalHt[pos].tail = newNode;
+    }
+}
+
+__device__ __forceinline__ void atomicAppend(HashIndexedView::Entry** globalHt, const size_t pos, HashIndexedView::Entry* newNode) {
+    HashIndexedView::Entry* currentHead = globalHt[pos];
+    HashIndexedView::Entry* old = currentHead;
+    do {
+        currentHead = old;
+        newNode->next = currentHead; 
+        newNode = tag(newNode, currentHead, newNode->hashValue);
+        old = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[pos], (unsigned long long)currentHead, (unsigned long long)newNode);
+    } while (old != currentHead);
+}
+
+
+template<HashIndexedViewBuilderType Qimpl = HashIndexedViewBuilderType::BufferToSM>
+__global__ void buildHashIndexedViewAdvancedSMEMWarpLevel(GrowingBuffer* buffer, HashIndexedView* view) {
+    const int warpCount = (blockDim.x + (warp_size-1)) / warp_size;
+    const int warpId = threadIdx.x / warp_size;
+    const int warpLane = threadIdx.x % warp_size;
+    const int numThreadsTotal = blockDim.x * gridDim.x;
+    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
+    // Num warps - 2^5. 
+    // 2^11 / 2^5 = 2^6; - 64 slots per warp, not bad.
+    const int numWarps = blockDim.x / warp_size; // 2^1 ... 2^5
+    const int powerTwoTemp{11};
+    const int subHtSize{1 << powerTwoTemp};
+    const int warpSubHtSize{subHtSize / numWarps};
+    // if(!threadIdx.x){
+    //     printf("numWarps=%d, warpSubHtSize=%d\n", numWarps, warpSubHtSize);
+    // }
+    // Example:
+    // 1024 threads means 32 warps.
+    // We can host 2^11 slots for 2^5 warps, each warp gets 2^6 slots.
+
+    const size_t scracthPadMask{subHtSize - 1};
+    __shared__ HIVEntry scracthPad[subHtSize];
+    HIVEntry* myScratchPadStart = &scracthPad[warpId * warpSubHtSize];
+    const size_t myScracthPadMask{warpSubHtSize - 1};
+
+    for(int i=warpLane; i < warpSubHtSize;i+=blockDim.x){
+        myScratchPadStart[i].writeOutPos = -1ll;
+        myScratchPadStart[i].head = nullptr;
+        myScratchPadStart[i].tail = nullptr;
+    }
+    
+    __syncwarp();
+
+    auto& values = buffer->getValues();
+    int bufferIdxStart{0};
+    int bufferIdxStep{0};
+    int bufferEntryIdxStart{0};
+    int bufferEntryIdxStep{0};
+    if constexpr(Qimpl == HashIndexedViewBuilderType::BufferToSM){
+        bufferIdxStart = blockIdx.x;
+        bufferIdxStep = gridDim.x;
+        bufferEntryIdxStart = threadIdx.x;
+        bufferEntryIdxStep = blockDim.x;
+    }
+    else{
+        bufferIdxStart = 0;
+        bufferIdxStep = 1;
+        bufferEntryIdxStart = globalTid;
+        bufferEntryIdxStep = numThreadsTotal;
+    }
+    // int conflictCnt{0};
+    for(int bufIdx=bufferIdxStart; bufIdx<values.buffers.count; bufIdx+=bufferIdxStep){ // Buffer-per-block
+        auto* buffer = &values.buffers.payLoad[bufIdx];
+        for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < buffer->numElements; bufEntryIdx+=bufferEntryIdxStep) { // Entry-per-warp
+            HashIndexedView::Entry* entry = (HashIndexedView::Entry*) &buffer->ptr[bufEntryIdx * typeSize];
+            size_t hash = (size_t) entry->hashValue;
+            const size_t posGlobal = hash & view->htMask;
+            const size_t posLocal = hash & myScracthPadMask;
+
+            HashIndexedView::Entry* localEntryCurrent = myScratchPadStart[posLocal].head;
+            HashIndexedView::Entry* old = localEntryCurrent;
+
+            const int64_t writeOutPos = atomicCAS((unsigned long long*)&myScratchPadStart[posLocal].writeOutPos, (unsigned long long)-1, (unsigned long long)posGlobal);
+            // printf("[Considering] writeOutPos=%lld, posGlobal=%lu, posLocal=%lu, hash=%d\n", writeOutPos, posGlobal, posLocal, entry->hashValue);
+
+            if(writeOutPos == -1 || writeOutPos == posGlobal){ // Was an empty SMEM slot, we just occupied it with posGlobal. OR matched the writeout position.
+                atomicAppendSMEM(myScratchPadStart, posLocal, entry);
+                // printf("[CACHED APPEND] writeOutPos=%lld, posLocal=%lu, hash=%d\n", writeOutPos, posLocal, entry->hashValue);
+
+            } else { // If we have a collision (scratch pad's entry writeout position != entry's writeOut pos) -> write directly to global.
+                atomicAppend(view->ht, posGlobal, entry);
+                // conflictCnt++;
+            }
+        }
+    }
+
+    __syncwarp();
+    for(int i=warpLane; i < warpSubHtSize;i+=blockDim.x){
+        if(myScratchPadStart[i].head){
+            atomicAppendSubList(view->ht, myScratchPadStart[i].writeOutPos, myScratchPadStart[i].head, myScratchPadStart[i].tail);
+            // printf("[FINAL] SUBCHAIN LENGTH %d\n", scracthPad[i].chainLength);
+        }
+    }
+
+    // __syncthreads();
+    // if(!threadIdx.x){
+    //     printf("[SMEM Warp Level] APPENDING CONFLICT %d\n", conflictCnt);
+    // }
+}
+
+template<HashIndexedViewBuilderType Qimpl = HashIndexedViewBuilderType::BufferToSM>
+__global__ void buildHashIndexedViewAdvancedSMEM(GrowingBuffer* buffer, HashIndexedView* view) {
+    const int warpCount = (blockDim.x + (warp_size-1)) / warp_size;
+    const int warpId = threadIdx.x / warp_size;
+    const int warpLane = threadIdx.x % warp_size;
+    const int numThreadsTotal = blockDim.x * gridDim.x;
+    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
+
+    const int powerTwoTemp{10};
+    const size_t scracthPadMask{(1 << powerTwoTemp) - 1};
+    __shared__ HIVEntry scracthPad[1 << powerTwoTemp];
+
+    for(int i = threadIdx.x; i < scracthPadMask+1; i+=blockDim.x){
+        scracthPad[i].writeOutPos = -1ll;
+        scracthPad[i].head = nullptr;
+        scracthPad[i].tail = nullptr;
+    }
+    __syncthreads();
+
+    auto& values = buffer->getValues();
+    int bufferIdxStart{0};
+    int bufferIdxStep{0};
+    int bufferEntryIdxStart{0};
+    int bufferEntryIdxStep{0};
+    if constexpr(Qimpl == HashIndexedViewBuilderType::BufferToSM){
+        bufferIdxStart = blockIdx.x;
+        bufferIdxStep = gridDim.x;
+        bufferEntryIdxStart = threadIdx.x;
+        bufferEntryIdxStep = blockDim.x;
+    }
+    else{
+        bufferIdxStart = 0;
+        bufferIdxStep = 1;
+        bufferEntryIdxStart = globalTid;
+        bufferEntryIdxStep = numThreadsTotal;
+    }
+    int conflictCnt{0};
+    for(int bufIdx=bufferIdxStart; bufIdx<values.buffers.count; bufIdx+=bufferIdxStep){ // Buffer-per-block
+        auto* buffer = &values.buffers.payLoad[bufIdx];
+        for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < buffer->numElements; bufEntryIdx+=bufferEntryIdxStep) { // Entry-per-warp
+            HashIndexedView::Entry* entry = (HashIndexedView::Entry*) &buffer->ptr[bufEntryIdx * typeSize];
+            size_t hash = (size_t) entry->hashValue;
+            const size_t posGlobal = hash & view->htMask;
+            const size_t posLocal = hash & scracthPadMask;
+
+            HashIndexedView::Entry* localEntryCurrent = scracthPad[posLocal].head;
+            HashIndexedView::Entry* old = localEntryCurrent;
+
+            const int64_t writeOutPos = atomicCAS((unsigned long long*)&scracthPad[posLocal].writeOutPos, (unsigned long long)-1, (unsigned long long)posGlobal);
+            // printf("[Considering] writeOutPos=%lld, posGlobal=%lu, posLocal=%lu, hash=%d\n", writeOutPos, posGlobal, posLocal, entry->hashValue);
+
+            if(writeOutPos == -1 || writeOutPos == posGlobal){ // Was an empty SMEM slot, we just occupied it with posGlobal. OR matched the writeout position.
+                atomicAppendSMEM(scracthPad, posLocal, entry);
+                // printf("[CACHED APPEND] writeOutPos=%lld, posLocal=%lu, hash=%d\n", writeOutPos, posLocal, entry->hashValue);
+
+            } else { // If we have a collision (scratch pad's entry writeout position != entry's writeOut pos) -> write directly to global.
+                atomicAppend(view->ht, posGlobal, entry);
+                conflictCnt++;
+            }
+        }
+    }
+
+    __syncthreads();
+    // if(!threadIdx.x){
+    //     printf("[SMEM] APPENDING CONFLICT %d\n", conflictCnt);
+    // }
+    for(int i = threadIdx.x; i < scracthPadMask+1; i+=blockDim.x){
+        if(scracthPad[i].head){
+            atomicAppendSubList(view->ht, scracthPad[i].writeOutPos, scracthPad[i].head, scracthPad[i].tail);
+            // printf("[FINAL] SUBCHAIN LENGTH %d\n", scracthPad[i].chainLength);
+        }
+    }
+    
+}
+
+template<HashIndexedViewBuilderType Qimpl = HashIndexedViewBuilderType::BufferToSM>
+__global__ void buildHashIndexedViewAdvanced(GrowingBuffer* buffer, HashIndexedView* view) {
+    const int warpCount = (blockDim.x + (warp_size-1)) / warp_size;
+    const int warpId = threadIdx.x / warp_size;
+    const int warpLane = threadIdx.x % warp_size;
+    const int numThreadsTotal = blockDim.x * gridDim.x;
+    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
+
+    const int powerTwoTemp{8};
+    const size_t scracthPadMask{(1 << powerTwoTemp) - 1};
+    HIVEntry scracthPad[1 << powerTwoTemp];
+    auto& values = buffer->getValues();
+    int bufferIdxStart{0};
+    int bufferIdxStep{0};
+    int bufferEntryIdxStart{0};
+    int bufferEntryIdxStep{0};
+    if constexpr(Qimpl == HashIndexedViewBuilderType::BufferToSM){
+        bufferIdxStart = blockIdx.x;
+        bufferIdxStep = gridDim.x;
+        bufferEntryIdxStart = threadIdx.x;
+        bufferEntryIdxStep = blockDim.x;
+    }
+    else{
+        bufferIdxStart = 0;
+        bufferIdxStep = 1;
+        bufferEntryIdxStart = globalTid;
+        bufferEntryIdxStep = numThreadsTotal;
+    }
+
+    // Naive Loop body: threads read the hash value and try to "insert" into ht[hash & view->htMask] which is the head of linked list. 
+    // PROBLEM: few groups -> severe overhead.
+    // DETAIL: But HTSize can be huge, it is of filtered scan size(!).
+    // IDEA: ESTIMATE whether we have < SMEM_SIZE/PTR_SIZE. This estimate can be used to determine whether we can fit into SMEM (i.e., we have few groups).
+    //       few groups -> fit in SMEM, aggregate locally (warp-level) and insert sub-list -> avoid severe bottleneck.
+
+    for(int bufIdx=bufferIdxStart; bufIdx<values.buffers.count; bufIdx+=bufferIdxStep){ // Buffer-per-block
+        auto* buffer = &values.buffers.payLoad[bufIdx];
+        for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < buffer->numElements; bufEntryIdx+=bufferEntryIdxStep) { // Entry-per-warp
+            HashIndexedView::Entry* entry = (HashIndexedView::Entry*) &buffer->ptr[bufEntryIdx * typeSize];
+            size_t hash = (size_t) entry->hashValue;
+            const size_t posGlobal = hash & view->htMask;
+            const size_t posLocal = hash & scracthPadMask;
+
+            HashIndexedView::Entry* localEntryCurrent = scracthPad[posLocal].head;
+            HashIndexedView::Entry* old = localEntryCurrent;
+
+            if (!scracthPad[posLocal].head || scracthPad[posLocal].writeOutPos == posLocal) { // if empty slot, don't care about write out pos
+                // printf("[TID %d][bufEntryIdx=%d] hash=%lu, scracthPad[posLocal].head=%p,  writeOutPos=%lu, local=%lu == global=%lu\n", globalTid, bufEntryIdx, hash, scracthPad[posLocal].head, scracthPad[posLocal].writeOutPos, posLocal, posGlobal);
+                
+                entry->next = scracthPad[posLocal].head; 
+
+                if (!scracthPad[posLocal].head) { // Insert first slot: head of list becomes the entry; entry->next is nullptr.
+                    scracthPad[posLocal].writeOutPos = posGlobal;
+                    scracthPad[posLocal].head = entry;
+                } else if(!scracthPad[posLocal].tail){ // Second insert: push down head to tail
+                    scracthPad[posLocal].tail = scracthPad[posLocal].head;
+                }
+                scracthPad[posLocal].head = entry;
+                scracthPad[posLocal].head = tag(entry, scracthPad[posLocal].head, hash);  
+                // scracthPad[posLocal].chainLength++;
+            } 
+            else { // non-empty slot AND different write out position.
+                atomicAppendSubList(view->ht, scracthPad[posLocal].writeOutPos, scracthPad[posLocal].head, scracthPad[posLocal].tail);
+                entry->next = nullptr; // Sublist appended, reset the new sublist.
+                // printf("[CONFLICT] SUBCHAIN LENGTH %d\n", scracthPad[posLocal].chainLength);
+                scracthPad[posLocal].writeOutPos = posGlobal;
+                scracthPad[posLocal].head = entry;
+                scracthPad[posLocal].tail = nullptr;
+                scracthPad[posLocal].head = tag(entry, scracthPad[posLocal].head, hash);  
+                // scracthPad[posLocal].chainLength=1;
+            }
+        }
+    }
+    for(int i = 0; i < 1 << powerTwoTemp; i++){
+        if(scracthPad[i].head){
+            atomicAppendSubList(view->ht, scracthPad[i].writeOutPos, scracthPad[i].head, scracthPad[i].tail);
+            // printf("[FINAL] SUBCHAIN LENGTH %d\n", scracthPad[i].chainLength);
+        }
+    }
 }
 
 template<HashIndexedViewBuilderType Qimpl = HashIndexedViewBuilderType::BufferToSM>
@@ -187,6 +483,12 @@ __global__ void buildHashIndexedView(GrowingBuffer* buffer, HashIndexedView* vie
         bufferEntryIdxStep = numThreadsTotal;
     }
 
+
+    // Naive Loop body: threads read the hash value and try to "insert" into ht[hash & view->htMask] which is the head of linked list. 
+    // PROBLEM: few groups -> severe overhead.
+    // DETAIL: But HTSize can be huge, it is of filtered scan size(!).
+    // IDEA: ESTIMATE whether we have < SMEM_SIZE/PTR_SIZE. This estimate can be used to determine whether we can fit into SMEM (i.e., we have few groups).
+    //       few groups -> fit in SMEM, aggregate locally (warp-level) and insert sub-list -> avoid severe bottleneck.
     for(int bufIdx=bufferIdxStart; bufIdx<values.buffers.count; bufIdx+=bufferIdxStep){ // Buffer-per-block
         auto* buffer = &values.buffers.payLoad[bufIdx];
         for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < buffer->numElements; bufEntryIdx+=bufferEntryIdxStep) { // Entry-per-warp
@@ -213,6 +515,8 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
     const int warpLane = threadIdx.x % warp_size;
     const int numThreadsTotal = blockDim.x * gridDim.x;
     const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
+    const int globalWarpID = globalTid / warp_size;
+
     constexpr size_t outputMask = PreAggregationHashtableFragment::numOutputs - 1;
     constexpr size_t htMask = PreAggregationHashtableFragment::hashtableSize - 1;
     constexpr size_t htShift = 6; 
@@ -221,6 +525,7 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
         Shared memory is mainly used to host ht scratchpad of multiple warp-level PreAggregationHashtableFragment.
     */
     extern __shared__ char sharedMem[];
+    HashIndexedViewEntry d;
     PreAggregationHashtableFragment* preAggrHTFrags = reinterpret_cast<PreAggregationHashtableFragment*>(sharedMem);
     PreAggregationHashtableFragment* myPreAggrHTFrag = &preAggrHTFrags[warpId];
     if(!warpLane){
@@ -238,7 +543,10 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
     // iterate over probe cols
     int probeColIdxStart = globalTid;
     int probeColIdxStep = numThreadsTotal;
-    for(int probeColIdx = probeColIdxStart; probeColIdx < probeColsLength; probeColIdx+=probeColIdxStep){
+    int roundedSize = ((probeColsLength + 31) / 32) * 32; 
+    for(int probeColIdx = probeColIdxStart; probeColIdx < roundedSize; probeColIdx+=probeColIdxStep){
+        const int maskLoop = __ballot_sync(0xFFFFFFFF, probeColIdx < probeColsLength);
+        if(probeColIdx >= probeColsLength){break;}
         const int val = probeCols[0][probeColIdx];
         const uint32_t hash = hashInt32(val);
         const uint32_t pos = hash & view->htMask;
@@ -249,13 +557,13 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
             if (foundMatch) {break;}
             current = current->next;
         }
-        const int maskFound = __ballot_sync(0xFFFFFFFF, foundMatch);
+        const int maskFound = __ballot_sync(maskLoop, foundMatch);
         if(foundMatch){
             const int groupVal = current->value;
             const uint32_t hashGroupCol = hashInt32(groupVal); // pack group cols: %132 = util.pack %131, %65, then calculate hash: db.hash %132
             HashIndexedViewEntry* outputEntry = reinterpret_cast<HashIndexedViewEntry*>(myPreAggrHTFrag->ht[hashGroupCol >> htShift & htMask]);
             // Warp barrier, avoid race conditions (possible writes) when probing ht, outputEntry is read in a thread-safe manner.
-            __syncwarp(maskFound); // synchronize read for all threads that found a match
+            // __syncwarp(maskFound); // synchronize read for all threads that found a match
             // At this point, warp threads can reference the same outputEntry (or even have the same key), we have 2 scenarios in this case:
             //  1. No insert is needed (matching key) -> atomically aggregate (lock/unlock).
             //  2. Insert is needed -> each warp thread will insert an element (no intra-warp aggregation on key-matching ht insertion - TODO).
@@ -277,13 +585,16 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
                     needInsert = true; // if hash doesn't match
                 }
             }
-            const int maskInsert = __ballot_sync(maskFound, needInsert);
+            __syncwarp(maskFound);
+            // const int maskInsert = __ballot_sync(0, needInsert);
             if(needInsert){
-                outputEntry = reinterpret_cast<HashIndexedViewEntry*>(myPreAggrHTFrag->insert(hashGroupCol, maskInsert));
+                outputEntry = reinterpret_cast<HashIndexedViewEntry*>(myPreAggrHTFrag->insert(hashGroupCol));
+                // printf("[%d]SETTING KEY %d of %p\n",threadIdx.x, groupVal,outputEntry);
                 outputEntry->key = groupVal; // write key
                 outputEntry->value = 0; // initialize value (aggregate)
             }
             PreAggregationHashtable::lock(reinterpret_cast<PreAggregationHashtable::Entry*>(outputEntry), 0);
+            // atomicAdd(&outputEntry->value, probeCols[numProbeCols-1][probeColIdx]);
             outputEntry->value += probeCols[numProbeCols-1][probeColIdx]; // update aggregate with non-key column.
             PreAggregationHashtable::unlock(reinterpret_cast<PreAggregationHashtable::Entry*>(outputEntry), 0);
 
@@ -303,9 +614,9 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
             }
         }
     }
-    if(!threadIdx.x){
+    if(!warpLane){
         acquire_lock(&globalLock);
-        memcpy(&globalOutputs[warpId*64], myPreAggrHTFrag->outputs, sizeof(PreAggregationHashtable::Entry*) * 64);
+        memcpy(&globalOutputs[globalWarpID*64], myPreAggrHTFrag->outputs, sizeof(FlexibleBuffer *) * 64);
         release_lock(&globalLock);
     }
     ///////////////////////////////////////////
@@ -316,9 +627,9 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
     //     printf("Collisions %d, matches %d\n", collisionCnt, matchCnt);
     // }
 
-    // if(!warpLane){ // DEBUG PRINT (for singlewarp/singlethreaded use)
+    if(!warpLane){ // DEBUG PRINT (for singlewarp/singlethreaded use)
         // myPreAggrHTFrag->print(printEntry);
-    // }
+    }
 }  
 
 struct Content{
@@ -344,18 +655,92 @@ __global__ void mergePreAggregationHashtableFragments(PreAggregationHashtable* p
     const int numThreadsTotal = blockDim.x * gridDim.x;
     const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
     if(!globalTid){
+        acquire_lock(&globalLock);
         new(preAggrHT) PreAggregationHashtable(preAllocatedPartitions);
+        release_lock(&globalLock);
+
         // preAggrHT->print();
+    } else if(!threadIdx.x){ // let each block wait until we touch the PreAggregationHashtable.
+        acquire_lock(&globalLock);
+        release_lock(&globalLock);
     }
     __syncthreads();
     int cntr{0};
-    for(int partitionId = 0; partitionId < 64; partitionId++){
+    int numPartitions = 64;
+    const int myPartitionId = blockIdx.x % numPartitions;
+    const int blocksPerPartition = max(1,gridDim.x / numPartitions);
+    const int blockIdxForPartition = blockIdx.x / numPartitions;
+
+
+    const int fragmentStart = blockIdxForPartition;
+    const int fragmentStep = blocksPerPartition;
+
+    const int bufferElemStart = threadIdx.x;
+    const int bufferElemStep = blockDim.x;
+    // printf("{myPartitionId=%d, blocksPerPartition=%d, blockIdxForPartition=%d}\n", myPartitionId,blocksPerPartition,blockIdxForPartition);
+    // printf("{fragmentStart=%d, fragmentStep=%d, bufferElemStart=%d, bufferElemStep=%d}\n", fragmentStart,fragmentStep,bufferElemStart,bufferElemStep);
+    for(int i = 0; i < 64; i++){
+    PreAggregationHashtable::Entry** myHt = preAggrHT->ht[i].ht;
+    const size_t myHtMask = preAggrHT->ht[i].hashMask;
+
+    for(int fragmentId = fragmentStart; fragmentId < numFrags; fragmentId += fragmentStep) {
+        FlexibleBuffer* fragmentPartitionBuffer = globalOutputsVec[fragmentId * numPartitions + myPartitionId];
+        if(!fragmentPartitionBuffer) { continue; }
+        for(int bufferIdx = 0; bufferIdx < fragmentPartitionBuffer->buffers.count; bufferIdx++){
+            Buffer* buf = &fragmentPartitionBuffer->buffers.payLoad[bufferIdx];
+            for (int elementIdx = bufferElemStart; elementIdx < buf->numElements; elementIdx+=bufferElemStep) {
+                PreAggregationHashtableFragment::Entry* curr = reinterpret_cast<PreAggregationHashtableFragment::Entry*>(&buf->ptr[elementIdx * typeSize]);
+                const size_t pos = curr->hashValue >> PreAggregationHashtableFragment::htShift & myHtMask;
+                PreAggregationHashtable::Entry* currCandidate = untag(myHt[pos]);
+                bool merged = false;
+                while (currCandidate) {
+                    if (currCandidate->hashValue == curr->hashValue && eqInt(currCandidate->content, curr->content)) {
+                        combineInt(currCandidate->content, curr->content);
+                        merged = true;
+                        break;
+                    }
+                    currCandidate = currCandidate->next;
+                }
+                if (!merged) {
+                    // PreAggregationHashtable::Entry** loc = reinterpret_cast<PreAggregationHashtable::Entry**>(localBuffer.insert());
+                    // *loc = curr;
+                    PreAggregationHashtable::Entry* previousPtr = myHt[pos];
+                    myHt[pos] = tag(curr, previousPtr, curr->hashValue);
+                    myHt[pos] = curr;
+                    curr->next = untag(previousPtr);
+                } 
+            }
+        }
+    }
+    }
+}
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+__global__ void mergePreAggregationHashtableFragmentsSingleThread(PreAggregationHashtable* preAggrHT, PreAggregationHashtable::PartitionHt* preAllocatedPartitions, FlexibleBuffer** globalOutputsVec, size_t numFrags) {
+    const int warpCount = (blockDim.x + (warp_size-1)) / warp_size;
+    const int warpId = threadIdx.x / warp_size;
+    const int warpLane = threadIdx.x % warp_size;
+    const int numThreadsTotal = blockDim.x * gridDim.x;
+    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
+    cg::grid_group grid = cg::this_grid();
+
+    if(!globalTid){
+        new(preAggrHT) PreAggregationHashtable(preAllocatedPartitions);
+    } 
+    // Synchronize all blocks
+    grid.sync();
+    int cntr{0};
+    /*
+        - Partitions: have hts that are mutually exclusive in terms of sync -> partition-to-SM
+        - Fragments: 
+    */
+   int partitionId = blockIdx.x;
         PreAggregationHashtable::Entry** ht = preAggrHT->ht[partitionId].ht;
         const size_t htMask = preAggrHT->ht[partitionId].hashMask;
-        for(int fragmentId = 0; fragmentId < static_cast<int>(numFrags); fragmentId++){
+        for(int fragmentId = 0; fragmentId < static_cast<int>(numFrags); fragmentId++){ 
             FlexibleBuffer* fragmentPartitionBuffer = globalOutputsVec[fragmentId * 64 + partitionId];
             if(!fragmentPartitionBuffer){continue;}
-            for(int bufferIdx = 0; bufferIdx < fragmentPartitionBuffer->buffers.count; bufferIdx++){
+            for(int bufferIdx = threadIdx.x; bufferIdx < fragmentPartitionBuffer->buffers.count; bufferIdx+=blockDim.x){
                 Buffer* buf = &fragmentPartitionBuffer->buffers.payLoad[bufferIdx];
                 for (int elementIdx = 0; elementIdx < buf->numElements; elementIdx++) {
                     PreAggregationHashtableFragment::Entry* curr = reinterpret_cast<PreAggregationHashtableFragment::Entry*>(&buf->ptr[elementIdx * typeSize]);
@@ -370,6 +755,7 @@ __global__ void mergePreAggregationHashtableFragments(PreAggregationHashtable* p
                         // auto* cand = reinterpret_cast<HashIndexedViewEntry*>(currCandidate);
                         // printf("  [Partition %d][POS %lu] Candidate hash=%llu, key=%d\n", partitionId, pos, cand->hashValue, cand->key);
                         if (currCandidate->hashValue == curr->hashValue && eqInt(currCandidate->content, curr->content)) {
+                            // printf("  [Partition %d][Fragment %d][POS %lu] Candidate hash=%llu, key=%d\n", partitionId, fragmentId, pos, cand->hashValue, cand->key);
                             combineInt(currCandidate->content, curr->content);
                             merged = true;
                             break;
@@ -394,7 +780,6 @@ __global__ void mergePreAggregationHashtableFragments(PreAggregationHashtable* p
         // // Append buffers that back partition's pointers (no invalidation, because buffer itself is not reallocated)
         // preAggrHT->buffer.merge(localBuffer); 
         // release_lock(&preAggrHT->mutex);
-    }
 }
 
 
@@ -452,9 +837,17 @@ int main(int argc, char* argv[]) {
     int** d_input_cols;
     CHECK_CUDA_ERROR(cudaMalloc(&d_input_cols, sizeof(int*) * numPredColumns));
     CHECK_CUDA_ERROR(cudaMallocHost(&hostCols[0], allocSize));
+    std::unordered_map<int, int> aggregated;
     for (int i = 0; i < arraySizeElems; ++i) {
         hostCols[0][i] = rand() % numbersThreshold;
+        if(hostCols[0][i] < LTPredicate){
+            aggregated[hostCols[0][i]] += hostCols[0][i];
+        }
     }
+    // for(auto[key, value]: aggregated){
+    //     std::cout << "{KEY: " << key << ", AGG: " << value << "}" << "\n";
+    // }
+
     // If you use one PreAggregationHashtableFragment and one thread, it should return arraySizeElems - duplicateCount, keys with duplicates are aggregated.
     checkForDuplicates(hostCols[0], arraySizeElems, false); 
     for(int colidx = 0; colidx < numPredColumns; colidx++){
@@ -547,10 +940,14 @@ int main(int argc, char* argv[]) {
             CHECK_CUDA_ERROR(cudaMemcpy(result_view, h_result_view, sizeof(HashIndexedView), cudaMemcpyHostToDevice)); // copy ht pointer and ht mask
 
             int hashBuilderNumBlocks=h_result->getValues().buffers.count;
+            std::cout << "[HashIndexedView] htSize="<< htAllocSize << "B, h_result->getValues().getLen()= " << h_result->getValues().getLen() << ", h_result->getValues().buffers.count=" << h_result->getValues().buffers.count << "\n";
             int hashBuilderNumThreadsPerTB=((std::min(h_result->getValues().getLen()/hashBuilderNumBlocks, 1024) +31)/32) *32;
-            // std::cout << "[buildHashIndexedView] Launch config: <<<" <<hashBuilderNumBlocks << ","<<hashBuilderNumThreadsPerTB <<  ">>>\n";
-            buildHashIndexedView<HashIndexedViewBuilderType::BufferToSM><<<hashBuilderNumBlocks,hashBuilderNumThreadsPerTB>>>(result, result_view);
-            // buildHashIndexedView<HashIndexedViewBuilderType::BufferToGPU><<<numBlocks,numThreadsInBlock>>>(result, result_view);
+            std::cout << "[buildHashIndexedView] Launch config: <<<" <<hashBuilderNumBlocks << ","<<hashBuilderNumThreadsPerTB <<  ">>>\n";
+            buildHashIndexedViewAdvancedSMEMWarpLevel<HashIndexedViewBuilderType::BufferToSM><<<hashBuilderNumBlocks,256>>>(result, result_view);
+            CHECK_CUDA_ERROR(cudaMemset(h_result_view->ht, 0, htAllocSize)); // zero ht buffer
+            buildHashIndexedViewAdvancedSMEM<HashIndexedViewBuilderType::BufferToSM><<<hashBuilderNumBlocks,256>>>(result, result_view);
+            CHECK_CUDA_ERROR(cudaMemset(h_result_view->ht, 0, htAllocSize)); // zero ht buffer
+            buildHashIndexedView<HashIndexedViewBuilderType::BufferToSM><<<numBlocks,numThreadsInBlock>>>(result, result_view);
             // printHashIndexedView<<<1,1>>>(result_view);
             cudaDeviceSynchronize();
             t = cudaGetLastError();
@@ -589,8 +986,28 @@ int main(int argc, char* argv[]) {
             }
             // std::cout << "[Merge HT FRAGMENTS] Total size = " << totalSum << ", num fragments " << numFragments << "\n";
             CHECK_CUDA_ERROR(cudaMemcpy(preAllocatedPartitions_d, preAllocatedPartitions_h, sizeof(PreAggregationHashtable::PartitionHt) * 64, cudaMemcpyHostToDevice));
-            mergePreAggregationHashtableFragments<<<1,1>>>(result_preAggrHT, preAllocatedPartitions_d, allOutputs_d, numFragments, eqInt, combineInt);
-            // printPreAggregationHashtable<<<1,1>>>(result_preAggrHT);
+            dim3 dimBlock(64);  // Cooperative launch, use (1, 1, 1) for block dimensions
+            dim3 dimGrid(64);   // Set grid dimensions according to your problem size
+
+            // Prepare kernel arguments
+            void* kernelArgs[] = {
+                &result_preAggrHT,
+                &preAllocatedPartitions_d,
+                &allOutputs_d,
+                (void*)&numFragments
+            };
+
+            // Launch the kernel using cudaLaunchCooperativeKernel
+            cudaError_t err = cudaLaunchCooperativeKernel(
+                (void*)mergePreAggregationHashtableFragmentsSingleThread,  // Kernel function pointer
+                dimGrid,    // Grid dimensions
+                dimBlock,   // Block dimensions
+                kernelArgs  // Array of kernel arguments
+            );
+            cudaDeviceSynchronize();
+
+            // mergePreAggregationHashtableFragmentsSingleThread<<<64,1>>>(result_preAggrHT, preAllocatedPartitions_d, allOutputs_d, numFragments, eqInt, combineInt);
+            // printPreAggregationHashtable<<<1,1>>>(result_preAggrHT, false);
             cudaDeviceSynchronize();
             t = cudaGetLastError();
             CHECK_CUDA_ERROR(t);
