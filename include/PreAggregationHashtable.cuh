@@ -32,11 +32,12 @@ class PreAggregationHashtableFragment {
     FlexibleBuffer* outputs[numOutputs];
     __device__ PreAggregationHashtableFragment(size_t typeSize) : ht(), typeSize(typeSize), len(0), outputs() {}  
 
-    __device__ Entry* insert(size_t hash, int mask) {
+    __device__ Entry* insert(size_t hash, int mask=0) {
         const int threadIdxInWarp = threadIdx.x % warpSize;
         const size_t outputIdx = hash & outputMask;
         // Are there any threads in THIS warp inserting to the same partition?
-        const int maskSamePartition = __match_any_sync(mask, (unsigned long long)outputIdx);
+        // acquire_lock(&x); // {key=6117,val=12234,hash=176388750,next=(nil)},
+        const int maskSamePartition = __match_any_sync(__activemask(), (unsigned long long)outputIdx);
         const int leader = __ffs(maskSamePartition) - 1;
         Entry* newEntry{nullptr};
         // If many write to the same partition, only one should do critical things.
@@ -54,11 +55,13 @@ class PreAggregationHashtableFragment {
             newEntry = reinterpret_cast<Entry*>(outputs[outputIdx]->prepareWriteFor(numMatching));
             // printf("AFT [TID %d][outIdx %lu][Buf %p][NumToWrite %d][warpOffset %d] buffers.back().numElements is %d\n", threadIdx.x, outputIdx, &outputs[outputIdx]->buffers.back(), numMatching, warpOffset, outputs[outputIdx]->buffers.back().numElements);
         }
-        newEntry = reinterpret_cast<Entry*>(__shfl_sync(maskSamePartition, (unsigned long long)newEntry, leader));
-        newEntry[warpOffset].hashValue = hash;
-        newEntry[warpOffset].next = nullptr;
+        uint8_t* bytePtr = reinterpret_cast<uint8_t*>(__shfl_sync(maskSamePartition, (unsigned long long)newEntry, leader));
+        newEntry = reinterpret_cast<Entry*>(&bytePtr[warpOffset*typeSize]) ;
+        newEntry->hashValue = hash;
+        newEntry->next = nullptr;
+        // release_lock(&x);
         // TODO: if threads try to write matching hash AND key, only the last write survives for further aggregations, all others retire immediately without any aggregation. 
-        atomicExch((unsigned long long*)&ht[hash >> htShift & htMask], (unsigned long long)&newEntry[warpOffset]);
+        atomicExch((unsigned long long*)&ht[hash >> htShift & htMask], (unsigned long long)newEntry);
         return newEntry; 
     }
 

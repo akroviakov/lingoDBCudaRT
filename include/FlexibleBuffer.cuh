@@ -145,9 +145,9 @@ __device__ __forceinline__ void* memAlloc(int numBytes){
 
 __device__ __forceinline__ void freePtr(void* ptr){
     #ifdef GALLATIN_ENABLED
-    return gallatin::allocators::global_free(ptr);
+    gallatin::allocators::global_free(ptr);
     #else
-    return free(ptr);
+    free(ptr);
     #endif
 }
 

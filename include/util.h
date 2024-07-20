@@ -6,6 +6,26 @@
 #include <chrono>
 #include <random>
 
+#include <unordered_set>
+
+void checkForDuplicates(int* hostCols, int arraySizeElems, bool printDuplicates = false) {
+    std::unordered_set<int> seenValues;
+    int duplicateCount = 0;
+    for (int i = 0; i < arraySizeElems; ++i) {
+        int currentValue = hostCols[i];
+
+        if (seenValues.find(currentValue) != seenValues.end()) {
+            duplicateCount++;
+            if (printDuplicates) {
+                std::cout << currentValue << "\n";
+            }
+        } else {
+            seenValues.insert(currentValue);
+        }
+    }
+    std::cout << "Total duplicates found: " << duplicateCount << "\n";
+}
+
 #define CHECK_CUDA_ERROR_ALLOC(err) \
     if (err != cudaSuccess) { \
         if (err == cudaErrorMemoryAllocation) { \

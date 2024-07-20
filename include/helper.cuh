@@ -13,6 +13,7 @@ __device__ T* tag(T* ptr, T* previousPtr, size_t hash) {
    auto* res = reinterpret_cast<T*>(tagged);
    return res;
 }
+
 template <typename T>
 __device__ T* filterTagged(T* ptr, size_t hash) {
    constexpr uint64_t ptrMask = 0x0000ffffffffffffull;
