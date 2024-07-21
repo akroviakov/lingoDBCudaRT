@@ -30,7 +30,7 @@ constexpr size_t heapSize = 3 * GiB;
 
 constexpr int initialCapacity = INITIAL_CAPACITY;
 constexpr float selectivity = 0.8;
-constexpr int numbersThreshold = 10000;
+constexpr int numbersThreshold = 10;
 constexpr int LTPredicate = (int)numbersThreshold * selectivity;
 __device__ volatile int globalLock = 0;
 
@@ -95,17 +95,27 @@ __global__ void growingBufferFill(int** input, int numPredColumns, int size, Gro
             colIdx++;
         }
         // TODO: revisit (see FlexibleBuffer::insertWarpLevel())
-        const unsigned int mask = __ballot_sync(0xFFFFFFFF, pred);
-        const int numActive = __popc(mask);
-        // assert(numActive >= 0 && numActive <= 32);
-        if(numActive){
-            const int threadOffset = __popc(mask & ((1U << lane) - 1));
+        // if (pred) {
+        //     HashIndexedViewEntry* writeCursor = (HashIndexedViewEntry*) currentWarpBuffer->getValues().insertWarpLevel();
+        //     writeCursor->key = input[0][i];
+        //     writeCursor->hashValue = hashInt32(writeCursor->key);
+        //     writeCursor->value = input[0][i];
+        //     writeCursor->nullFlag = false;
+        // }
+
+        // DO NOT USE __activemask(), threads from the same warp can arrive here at different time 
+        //  and __activemask() would NOT block the entire warp, then in prepareWriteFor, the warp threads can again converge, but
+        //  there would be already 2 leaders as one warp had two different masks due to __activemask() which is race condition!
+        const unsigned int mask = __ballot_sync(0xFFFFFFFF, pred); 
+        if(mask){
             HashIndexedViewEntry* writeCursor;
-            if (lane == 0) {
-                writeCursor = (HashIndexedViewEntry*) currentWarpBuffer->getValues().prepareWriteFor(numActive);
+            const int leader{__ffs(mask)-1};
+            if (lane == leader) {
+                writeCursor = (HashIndexedViewEntry*) currentWarpBuffer->getValues().prepareWriteFor(__popc(mask));
             }
-            writeCursor = (HashIndexedViewEntry*) __shfl_sync(0xFFFFFFFF, (uintptr_t)writeCursor, 0);
             if (pred) {
+                const int threadOffset = __popc(mask & ((1U << lane) - 1));
+                writeCursor = (HashIndexedViewEntry*) __shfl_sync(mask, (uintptr_t)writeCursor, leader);
                 writeCursor[threadOffset].key = input[0][i];
                 writeCursor[threadOffset].hashValue = hashInt32(writeCursor[threadOffset].key);
                 // printf("KEY: %d, HASH: %llu\n", input[0][i], writeCursor[threadOffset].hashValue);
@@ -509,6 +519,8 @@ __global__ void buildHashIndexedView(GrowingBuffer* buffer, HashIndexedView* vie
 
 __device__ int collisionCnt{0};
 __device__ int matchCnt{0};
+__device__ int keyCnt{0};
+
 __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numProbeCols, int probeColsLength, HashIndexedView* view, FlexibleBuffer** globalOutputs, size_t* htSizes) {
     const int warpCount = (blockDim.x + (warp_size-1)) / warp_size;
     const int warpId = threadIdx.x / warp_size;
@@ -545,7 +557,7 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
     int probeColIdxStep = numThreadsTotal;
     int roundedSize = ((probeColsLength + 31) / 32) * 32; 
     for(int probeColIdx = probeColIdxStart; probeColIdx < roundedSize; probeColIdx+=probeColIdxStep){
-        const int maskLoop = __ballot_sync(0xFFFFFFFF, probeColIdx < probeColsLength);
+        // const int maskLoop = __ballot_sync(0xFFFFFFFF, probeColIdx < probeColsLength);
         if(probeColIdx >= probeColsLength){break;}
         const int val = probeCols[0][probeColIdx];
         const uint32_t hash = hashInt32(val);
@@ -557,7 +569,7 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
             if (foundMatch) {break;}
             current = current->next;
         }
-        const int maskFound = __ballot_sync(maskLoop, foundMatch);
+        // const int maskFound = __ballot_sync(maskLoop, foundMatch);
         if(foundMatch){
             const int groupVal = current->value;
             const uint32_t hashGroupCol = hashInt32(groupVal); // pack group cols: %132 = util.pack %131, %65, then calculate hash: db.hash %132
@@ -585,13 +597,14 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
                     needInsert = true; // if hash doesn't match
                 }
             }
-            __syncwarp(maskFound);
+            // __syncwarp(maskFound);
             // const int maskInsert = __ballot_sync(0, needInsert);
             if(needInsert){
                 outputEntry = reinterpret_cast<HashIndexedViewEntry*>(myPreAggrHTFrag->insert(hashGroupCol));
                 // printf("[%d]SETTING KEY %d of %p\n",threadIdx.x, groupVal,outputEntry);
                 outputEntry->key = groupVal; // write key
                 outputEntry->value = 0; // initialize value (aggregate)
+                atomicExch((unsigned long long*)&myPreAggrHTFrag->ht[hash >> htShift & htMask], (unsigned long long)outputEntry);
             }
             PreAggregationHashtable::lock(reinterpret_cast<PreAggregationHashtable::Entry*>(outputEntry), 0);
             // atomicAdd(&outputEntry->value, probeCols[numProbeCols-1][probeColIdx]);
@@ -613,11 +626,7 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
                 su += myPreAggrHTFrag->outputs[i]->getLen();
             }
         }
-    }
-    if(!warpLane){
-        acquire_lock(&globalLock);
         memcpy(&globalOutputs[globalWarpID*64], myPreAggrHTFrag->outputs, sizeof(FlexibleBuffer *) * 64);
-        release_lock(&globalLock);
     }
     ///////////////////////////////////////////
     // if(!warpLane){
@@ -631,6 +640,156 @@ __global__ void buildPreAggregationHashtableFragments(int** probeCols, int numPr
         // myPreAggrHTFrag->print(printEntry);
     }
 }  
+
+
+struct BuildStatsRadixCache{
+    int scanSize{0};
+    int size{0};
+    int hits{0};
+    int keyMismatch{0};
+    int hashMismatch{0};
+    int evicted{0};
+
+    __device__ void print(){
+        printf("[PreAggregationHTFrag BuildStats] : scanSize=%d, cacheSize=%d, cacheHits=%d, cacheKeyMismatch=%d, hashMismatch=%d, evicted=%d\n",scanSize, size, hits, keyMismatch, hashMismatch, evicted);
+    }
+};
+__device__ BuildStatsRadixCache buildStats;
+__global__ void buildPreAggregationHashtableFragmentsAdvanced(int** probeCols, 
+        int numProbeCols, 
+        int probeColsLength, 
+        HashIndexedView* view, 
+        FlexibleBuffer** globalOutputs, 
+        size_t* htSizes) 
+    {
+    //  1024 threads per block, the maximum registers per thread is 64
+    const int warpCount = (blockDim.x + (warp_size-1)) / warp_size;
+    const int warpId = threadIdx.x / warp_size;
+    const int warpLane = threadIdx.x % warp_size;
+    const int numThreadsTotal = blockDim.x * gridDim.x;
+    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
+    const int globalWarpID = globalTid / warp_size;
+
+    constexpr size_t outputMask = PreAggregationHashtableFragment::numOutputs - 1;
+    constexpr size_t htShift = 6; 
+
+
+    const int powerTwoTemp{10};
+    const int scracthPadSize{1 << powerTwoTemp};
+    const size_t scracthPadMask{scracthPadSize - 1};
+
+    __shared__ PreAggregationHashtableFragmentSMEM::Entry* scracthPad[scracthPadSize];
+    for(int i = threadIdx.x; i < scracthPadSize; i+=blockDim.x){
+        scracthPad[i] = nullptr;
+    }
+    if(threadIdx.x == 0){
+        buildStats = BuildStatsRadixCache{};
+        buildStats.scanSize = probeColsLength;
+        buildStats.size=scracthPadSize;
+    }
+    __syncthreads();
+
+
+    if(!warpLane){
+        // Warp stores its PreAggregationHashtableFragmentSMEM on heap, the pointer is cached on 
+        globalOutputs[globalWarpID*64] = reinterpret_cast<FlexibleBuffer*>(memAlloc(sizeof(PreAggregationHashtableFragmentSMEM)));
+        new(reinterpret_cast<PreAggregationHashtableFragmentSMEM*>(globalOutputs[globalWarpID*64])) PreAggregationHashtableFragmentSMEM(typeSize, scracthPad, scracthPadSize);
+    }
+    __syncwarp(); // Read allocated pointer after we are sure a thread has stored the allocation.
+    PreAggregationHashtableFragmentSMEM* myFrag = reinterpret_cast<PreAggregationHashtableFragmentSMEM*>(globalOutputs[globalWarpID*64]);
+    // if(!warpLane){
+    //     printf("[TID=%d, WARPID=%d] myFrag=%p\n", globalTid, warpId, myFrag);
+    // }
+
+    // iterate over probe cols
+    int probeColIdxStart = globalTid;
+    int probeColIdxStep = numThreadsTotal;
+    int roundedSize = ((probeColsLength + 31) / 32) * 32; 
+    for(int probeColIdx = probeColIdxStart; probeColIdx < roundedSize; probeColIdx+=probeColIdxStep){
+        bool remainInLoop{probeColIdx < probeColsLength};
+        const int maskLoop = __ballot_sync(0xFFFFFFFF, remainInLoop);
+        if(!remainInLoop){break;}
+        ////// PROBE JOIN CONDITION //////
+        const int key = probeCols[0][probeColIdx];
+        const int val = probeCols[numProbeCols-1][probeColIdx];
+        const uint32_t hash = hashInt32(key);
+        const uint32_t pos = hash & view->htMask;
+        HashIndexedViewEntry* current = reinterpret_cast<HashIndexedViewEntry*>(view->ht[pos]); // we have one view here (can have more in case of joins)
+        bool foundMatch{false};
+        while(current){ 
+            foundMatch = (current->hashValue == hash && current->key == key);
+            if (foundMatch) {break;}
+            current = current->next;
+        }
+        ////// [END] PROBE JOIN CONDITION //////
+        ////// INSERT/UPDATE PARTIAL AGGREGATE //////
+        const int maskFoundMatch = __ballot_sync(maskLoop, foundMatch);
+        if(foundMatch){
+            const int groupVal = current->value;
+            const uint32_t hashGroupCol = hashInt32(groupVal);
+            const int scracthPadPos = (hashGroupCol >> htShift) & scracthPadMask;
+            HashIndexedViewEntry* partialAggEntry = reinterpret_cast<HashIndexedViewEntry*>(scracthPad[scracthPadPos]);
+            bool needInsert{true};
+            if(!partialAggEntry){ 
+                needInsert = true; // if no entry found (nullptr) at position
+            } else {
+                if(partialAggEntry->hashValue == hashGroupCol){ 
+                    if(partialAggEntry->key == groupVal){
+                        atomicAdd(&buildStats.hits, 1);
+                        needInsert = false; // if found entry, hash and key match
+                    } else { 
+                        atomicAdd(&buildStats.keyMismatch, 1);
+                        needInsert = true; // if key doesn't match, collision -> insert
+                    }
+                } else { 
+                    atomicAdd(&buildStats.hashMismatch,1);
+                    needInsert = true; // if hash doesn't match
+                }
+            }
+            const int maskNeedInsert = __ballot_sync(maskFoundMatch, needInsert);
+            if(needInsert){ // myFrag is warp-local, so multiple threads of the same warp can call insert()
+
+                // printf("[%d]SETTING KEY %d of %p\n",threadIdx.x, groupVal,partialAggEntry);
+                partialAggEntry = reinterpret_cast<HashIndexedViewEntry*>(myFrag->insert(hashGroupCol, maskNeedInsert));
+                partialAggEntry->key = groupVal; // write key
+                partialAggEntry->value = 0; // initialize value (aggregate)
+                if(atomicExch((unsigned long long*)&myFrag->ht[scracthPadPos], (unsigned long long)partialAggEntry) == 0){atomicAdd(&buildStats.evicted, 1);} // only write ptr to an initialized entry 
+            }
+            atomicAdd(&partialAggEntry->value, val);
+            // if(groupVal != outputEntry->value){
+                // printf("[WarpId %d | TID %d] Key %d, Val %d\n", warpId, globalTid, groupVal, outputEntry->value);
+            // }
+        }
+        ////// [END] INSERT/UPDATE PARTIAL AGGREGATE //////
+    }
+    __syncthreads();
+
+    // if(!warpLane){ // DEBUG PRINT (for singlewarp/singlethreaded use)
+    //     acquire_lock(&globalLock);
+    //     myFrag->print(printEntry);
+    //     release_lock(&globalLock);
+    // }
+    if(!warpLane){
+        int su = 0;
+        for(int i = 0; i < 64; i++){
+            if(myFrag->outputs[i]){
+                atomicAdd((unsigned long long*)&htSizes[i], (unsigned long long)myFrag->outputs[i]->getLen());
+                su += myFrag->outputs[i]->getLen();
+            }
+        }
+        memcpy(&globalOutputs[globalWarpID*64], myFrag->outputs, sizeof(FlexibleBuffer *) * 64);
+        freePtr(myFrag);
+    }
+    ///////////////////////////////////////////
+    // if(!warpLane){
+    //     printf("[%d | WarpId %d] preAggrHTFrag length: %lu\n", blockIdx.x, warpId, myPreAggrHTFrag->len);
+    // }
+    // if(!threadIdx.x){ // check that preAggrHT is initialized
+    //     buildStats.print();
+    // }
+}  
+
+
 
 struct Content{
     bool flag;
@@ -716,6 +875,12 @@ __global__ void mergePreAggregationHashtableFragments(PreAggregationHashtable* p
 }
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
+
+__global__ void INITPreAggregationHashtableFragmentsSingleThread(PreAggregationHashtable* preAggrHT, PreAggregationHashtable::PartitionHt* preAllocatedPartitions){
+    if(blockDim.x * blockIdx.x + threadIdx.x == 0){
+        new(preAggrHT) PreAggregationHashtable(preAllocatedPartitions);
+    }
+}
 __global__ void mergePreAggregationHashtableFragmentsSingleThread(PreAggregationHashtable* preAggrHT, PreAggregationHashtable::PartitionHt* preAllocatedPartitions, FlexibleBuffer** globalOutputsVec, size_t numFrags) {
     const int warpCount = (blockDim.x + (warp_size-1)) / warp_size;
     const int warpId = threadIdx.x / warp_size;
@@ -808,6 +973,10 @@ __global__ void checkHashIndexSize(GrowingBuffer* buffer, HashIndexedView* view)
     }
 }
 
+
+
+// 8 mil: 10ms
+// 1 mil: 1ms
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " arraySizeElems numBlocks numThreadsInBlock numPredColumns printHeader(optional)\n";
@@ -844,9 +1013,11 @@ int main(int argc, char* argv[]) {
             aggregated[hostCols[0][i]] += hostCols[0][i];
         }
     }
-    // for(auto[key, value]: aggregated){
-    //     std::cout << "{KEY: " << key << ", AGG: " << value << "}" << "\n";
-    // }
+    if(numbersThreshold==10){
+        for(auto[key, value]: aggregated){
+            std::cout << "{KEY: " << key << ", AGG: " << value << "}" << "\n";
+        }
+    }
 
     // If you use one PreAggregationHashtableFragment and one thread, it should return arraySizeElems - duplicateCount, keys with duplicates are aggregated.
     checkForDuplicates(hostCols[0], arraySizeElems, false); 
@@ -884,7 +1055,7 @@ int main(int argc, char* argv[]) {
 
 
     int numWarps = getNumberOfElementsInSMEM(sizeof(PreAggregationHashtableFragment));
-    size_t numThreadsInBlockPreAggr = std::min(numThreadsInBlock, numWarps*32);
+    size_t numThreadsInBlockPreAggr = 512; std::min(numThreadsInBlock, numWarps*32);
     std::cout << "[PreAggregationHashtableFragment] launch threads per block : " << numThreadsInBlockPreAggr 
         << ", SMEM can fit "<< numWarps*32 << " threads, SMEM size is " << getSharedMemorySize() << "B, PreAggregationHashtableFragment size is " << sizeof(PreAggregationHashtableFragment) << "B\n";
     PreAggregationHashtable* h_result_preAggrHT;
@@ -943,8 +1114,8 @@ int main(int argc, char* argv[]) {
             std::cout << "[HashIndexedView] htSize="<< htAllocSize << "B, h_result->getValues().getLen()= " << h_result->getValues().getLen() << ", h_result->getValues().buffers.count=" << h_result->getValues().buffers.count << "\n";
             int hashBuilderNumThreadsPerTB=((std::min(h_result->getValues().getLen()/hashBuilderNumBlocks, 1024) +31)/32) *32;
             std::cout << "[buildHashIndexedView] Launch config: <<<" <<hashBuilderNumBlocks << ","<<hashBuilderNumThreadsPerTB <<  ">>>\n";
-            buildHashIndexedViewAdvancedSMEMWarpLevel<HashIndexedViewBuilderType::BufferToSM><<<hashBuilderNumBlocks,256>>>(result, result_view);
-            CHECK_CUDA_ERROR(cudaMemset(h_result_view->ht, 0, htAllocSize)); // zero ht buffer
+            // buildHashIndexedViewAdvancedSMEMWarpLevel<HashIndexedViewBuilderType::BufferToSM><<<hashBuilderNumBlocks,256>>>(result, result_view);
+            // CHECK_CUDA_ERROR(cudaMemset(h_result_view->ht, 0, htAllocSize)); // zero ht buffer
             buildHashIndexedViewAdvancedSMEM<HashIndexedViewBuilderType::BufferToSM><<<hashBuilderNumBlocks,256>>>(result, result_view);
             CHECK_CUDA_ERROR(cudaMemset(h_result_view->ht, 0, htAllocSize)); // zero ht buffer
             buildHashIndexedView<HashIndexedViewBuilderType::BufferToSM><<<numBlocks,numThreadsInBlock>>>(result, result_view);
@@ -961,10 +1132,15 @@ int main(int argc, char* argv[]) {
             cudaMemset(outputsSizes_d, 0, sizeof(size_t) * 64); // sizes are accumulated, so first init to 0 
 
             const size_t numFragments = max(1ul,(numBlocks*numThreadsInBlockPreAggr)/32); // each warp has 1 fragment
-            const size_t outputsPointersArraySize = sizeof(FlexibleBuffer*) * (64 * numFragments); // each fragment has 64 partitions
-            CHECK_CUDA_ERROR(cudaMalloc(&allOutputs_d, outputsPointersArraySize)); 
 
-            buildPreAggregationHashtableFragments<<<numBlocks,numThreadsInBlockPreAggr,getSharedMemorySize()>>>(d_input_cols, numPredColumns, arraySizeElems, result_view, allOutputs_d, outputsSizes_d);
+            const size_t outputsPointersArraySize = sizeof(FlexibleBuffer*) * (64 * numFragments); // each fragment has 64 partitions
+
+            CHECK_CUDA_ERROR(cudaMalloc(&allOutputs_d, outputsPointersArraySize)); 
+            std::cout << "[buildPreAggregationHashtableFragments] Launch config: <<<" <<numBlocks << ","<<numThreadsInBlockPreAggr <<  ">>>\n";
+            // buildPreAggregationHashtableFragments<<<numBlocks,numThreadsInBlockPreAggr,getSharedMemorySize()>>>(d_input_cols, numPredColumns, arraySizeElems, result_view, allOutputs_d, outputsSizes_d);
+            //
+            // 1024-128 due to high register usage
+            buildPreAggregationHashtableFragmentsAdvanced<<<numBlocks,numThreadsInBlockPreAggr>>>(d_input_cols, numPredColumns, arraySizeElems, result_view, allOutputs_d, outputsSizes_d);
             cudaDeviceSynchronize();
             t = cudaGetLastError();
             CHECK_CUDA_ERROR(t);
@@ -982,7 +1158,7 @@ int main(int argc, char* argv[]) {
                 CHECK_CUDA_ERROR(cudaMalloc(&preAllocatedPartitions_h[outputId].ht, htAllocSize));
                 CHECK_CUDA_ERROR(cudaMemset(preAllocatedPartitions_h[outputId].ht, 0, htAllocSize));
                 // totalSum += outputsSizes_h[outputId];
-                // std::cout << "[HOST][ALLOCATE PARTITION "<< outputId << "], given size " << outputsSizes_h[outputId] << ": allocSize=" << htAllocSize << " B, at " << preAllocatedPartitions_h[outputId].ht << ", ht mask is " << htMask << "\n";
+                // std::cout << "[HOST][ALLOCATE FINAL HT PARTITION "<< outputId << "], given size " << outputsSizes_h[outputId] << ": allocSize=" << htAllocSize << " B, at " << preAllocatedPartitions_h[outputId].ht << ", ht mask is " << htMask << "\n";
             }
             // std::cout << "[Merge HT FRAGMENTS] Total size = " << totalSum << ", num fragments " << numFragments << "\n";
             CHECK_CUDA_ERROR(cudaMemcpy(preAllocatedPartitions_d, preAllocatedPartitions_h, sizeof(PreAggregationHashtable::PartitionHt) * 64, cudaMemcpyHostToDevice));
@@ -1005,9 +1181,11 @@ int main(int argc, char* argv[]) {
                 kernelArgs  // Array of kernel arguments
             );
             cudaDeviceSynchronize();
-
+            // INITPreAggregationHashtableFragmentsSingleThread<<<1,1>>>(result_preAggrHT, preAllocatedPartitions_d);
             // mergePreAggregationHashtableFragmentsSingleThread<<<64,1>>>(result_preAggrHT, preAllocatedPartitions_d, allOutputs_d, numFragments, eqInt, combineInt);
-            // printPreAggregationHashtable<<<1,1>>>(result_preAggrHT, false);
+            if(numbersThreshold==10){
+                printPreAggregationHashtable<<<1,1>>>(result_preAggrHT, false);
+            }
             cudaDeviceSynchronize();
             t = cudaGetLastError();
             CHECK_CUDA_ERROR(t);
