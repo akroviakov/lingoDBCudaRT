@@ -66,7 +66,11 @@ enum class HashIndexedViewBuilderType{
     BufferToGPU = 2
 };
 
-
+__global__ void growingBufferInit(GrowingBuffer* finalBuffer) {
+    if(blockDim.x * blockIdx.x + threadIdx.x == 0){
+        new(finalBuffer) GrowingBuffer(initialCapacity, typeSize, false);
+    }
+}
 __global__ void growingBufferFill(int** input, int numPredColumns, int size, GrowingBuffer* finalBuffer) {
     const int warp_count = (blockDim.x + (warp_size-1)) / warp_size;
     const int numThreadsTotal = blockDim.x * gridDim.x;
@@ -75,12 +79,6 @@ __global__ void growingBufferFill(int** input, int numPredColumns, int size, Gro
     const int warpId = threadIdx.x / warp_size;
     extern __shared__ char sharedMem[];
     GrowingBuffer* warpBuffers = reinterpret_cast<GrowingBuffer*>(sharedMem);
-    if(globalTid == 0){ // race condition: globalTid != 0 skips this, can skip the loop and appear in merge before globalTid==0 even initializes.
-        acquire_lock(&globalLock);
-        new(finalBuffer) GrowingBuffer(initialCapacity, typeSize, false);
-        __threadfence();
-        release_lock(&globalLock);
-    }
     GrowingBuffer* currentWarpBuffer = &warpBuffers[warpId];
     if(lane == 0){
         new (currentWarpBuffer) GrowingBuffer(initialCapacity, typeSize);
@@ -873,8 +871,6 @@ __global__ void mergePreAggregationHashtableFragments(PreAggregationHashtable* p
     }
     }
 }
-#include <cooperative_groups.h>
-namespace cg = cooperative_groups;
 
 __global__ void INITPreAggregationHashtableFragmentsSingleThread(PreAggregationHashtable* preAggrHT, PreAggregationHashtable::PartitionHt* preAllocatedPartitions){
     if(blockDim.x * blockIdx.x + threadIdx.x == 0){
@@ -887,64 +883,67 @@ __global__ void mergePreAggregationHashtableFragmentsSingleThread(PreAggregation
     const int warpLane = threadIdx.x % warp_size;
     const int numThreadsTotal = blockDim.x * gridDim.x;
     const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
-    cg::grid_group grid = cg::this_grid();
 
-    if(!globalTid){
-        new(preAggrHT) PreAggregationHashtable(preAllocatedPartitions);
-    } 
-    // Synchronize all blocks
-    grid.sync();
     int cntr{0};
     /*
         - Partitions: have hts that are mutually exclusive in terms of sync -> partition-to-SM
         - Fragments: 
     */
-   int partitionId = blockIdx.x;
-        PreAggregationHashtable::Entry** ht = preAggrHT->ht[partitionId].ht;
-        const size_t htMask = preAggrHT->ht[partitionId].hashMask;
-        for(int fragmentId = 0; fragmentId < static_cast<int>(numFrags); fragmentId++){ 
-            FlexibleBuffer* fragmentPartitionBuffer = globalOutputsVec[fragmentId * 64 + partitionId];
-            if(!fragmentPartitionBuffer){continue;}
-            for(int bufferIdx = threadIdx.x; bufferIdx < fragmentPartitionBuffer->buffers.count; bufferIdx+=blockDim.x){
-                Buffer* buf = &fragmentPartitionBuffer->buffers.payLoad[bufferIdx];
-                for (int elementIdx = 0; elementIdx < buf->numElements; elementIdx++) {
-                    PreAggregationHashtableFragment::Entry* curr = reinterpret_cast<PreAggregationHashtableFragment::Entry*>(&buf->ptr[elementIdx * typeSize]);
-                    const size_t pos = curr->hashValue >> PreAggregationHashtableFragment::htShift & htMask;
-                    
-                    // auto* p = reinterpret_cast<HashIndexedViewEntry*>(curr);
-                    // printf("[Partition %d][POS %lu] MERGING hash=%llu, key=%d\n", partitionId, pos, p->hashValue, p->key);
+    int partitionId = blockIdx.x % 64;
+    int partitionWorkerId = blockIdx.x / 64;
 
-                    PreAggregationHashtable::Entry* currCandidate = untag(ht[pos]);
-                    bool merged = false;
-                    while (currCandidate) {
-                        // auto* cand = reinterpret_cast<HashIndexedViewEntry*>(currCandidate);
-                        // printf("  [Partition %d][POS %lu] Candidate hash=%llu, key=%d\n", partitionId, pos, cand->hashValue, cand->key);
-                        if (currCandidate->hashValue == curr->hashValue && eqInt(currCandidate->content, curr->content)) {
-                            // printf("  [Partition %d][Fragment %d][POS %lu] Candidate hash=%llu, key=%d\n", partitionId, fragmentId, pos, cand->hashValue, cand->key);
-                            combineInt(currCandidate->content, curr->content);
-                            merged = true;
-                            break;
-                        }
-                        currCandidate = currCandidate->next;
-                    }
-                    // Otherwise we insert it into the backing buffer.
-                    if (!merged) {
-                        // PreAggregationHashtable::Entry** loc = reinterpret_cast<PreAggregationHashtable::Entry**>(localBuffer.insert());
-                        // *loc = curr;
-                        PreAggregationHashtable::Entry* previousPtr = ht[pos];
-                        ht[pos] = tag(curr, previousPtr, curr->hashValue);
-                        ht[pos] = curr;
-                        // printf("Loc (Entry**) %p, curr (Entry*) %p, previousPtr (Entry*) %p, ht[pos %lu] (Entry*) %p \n", nullptr, curr, previousPtr, pos, &ht[pos]);
-                        curr->next = untag(previousPtr);
-                    } 
+    int blocks_per_partition = gridDim.x / 64;
+    int extra_blocks = gridDim.x % 64;
+    int stride = blocks_per_partition + (partitionId <= extra_blocks);
+
+    PreAggregationHashtable::Entry** ht = preAggrHT->ht[partitionId].ht;
+    const size_t htMask = preAggrHT->ht[partitionId].hashMask;
+    __syncthreads();
+    for(int fragmentId = 0; fragmentId < static_cast<int>(numFrags); fragmentId++){ 
+        FlexibleBuffer* fragmentPartitionBuffer = globalOutputsVec[fragmentId * 64 + partitionId];
+        if(!fragmentPartitionBuffer){continue;}
+        for(int bufferIdx = partitionWorkerId; bufferIdx < fragmentPartitionBuffer->buffers.count; bufferIdx+=stride){
+            Buffer* buf = &fragmentPartitionBuffer->buffers.payLoad[bufferIdx];
+            for (int elementIdx = threadIdx.x; elementIdx < buf->numElements; elementIdx+=blockDim.x) {
+                PreAggregationHashtableFragment::Entry* curr = reinterpret_cast<PreAggregationHashtableFragment::Entry*>(&buf->ptr[elementIdx * typeSize]);
+                const size_t pos = curr->hashValue >> PreAggregationHashtableFragment::htShift & htMask;
+                
+                // auto* p = reinterpret_cast<HashIndexedViewEntry*>(curr);
+                // printf("[Partition %d][POS %lu] MERGING hash=%llu, key=%d\n", partitionId, pos, p->hashValue, p->key);
+                // PreAggregationHashtable::Entry* currCandidate = untag(ht[pos]);
+                PreAggregationHashtable::Entry* currCandidate;
+                do{
+                    currCandidate = reinterpret_cast<PreAggregationHashtable::Entry*>(atomicExch((unsigned long long*)&ht[pos], 1ull));
                 }
-            }
+                while((unsigned long long)currCandidate == 1ull);
 
+                bool merged = false;
+                while (currCandidate) {
+                    if (currCandidate->hashValue == curr->hashValue && eqInt(currCandidate->content, curr->content)) {
+                        combineInt(currCandidate->content, curr->content);
+                        merged = true;
+                        break;
+                    }
+                    currCandidate = currCandidate->next;
+                }
+                if (!merged) {
+                    PreAggregationHashtable::Entry* previousPtr = currCandidate;
+                    currCandidate = tag(curr, previousPtr, curr->hashValue);
+                    currCandidate = curr;
+                    curr->next = untag(previousPtr);
+                }
+                atomicExch((unsigned long long*)&ht[pos], (unsigned long long)currCandidate);
+                // if(atomicCAS((unsigned long long*)&ht[pos], 1ull, (unsigned long long)currCandidate) != 1ull){
+                    // printf("Trouble\n");
+                // }
+            }
         }
-        // acquire_lock(&preAggrHT->mutex);
-        // // Append buffers that back partition's pointers (no invalidation, because buffer itself is not reallocated)
-        // preAggrHT->buffer.merge(localBuffer); 
-        // release_lock(&preAggrHT->mutex);
+
+    }
+    // acquire_lock(&preAggrHT->mutex);
+    // // Append buffers that back partition's pointers (no invalidation, because buffer itself is not reallocated)
+    // preAggrHT->buffer.merge(localBuffer); 
+    // release_lock(&preAggrHT->mutex);
 }
 
 
@@ -1086,6 +1085,9 @@ int main(int argc, char* argv[]) {
             CHECK_CUDA_ERROR(cudaMemcpyToSymbol(deviceCounters, counters, 4 * sizeof(int), 0, cudaMemcpyHostToDevice));
             cudaEventRecord(start, 0);
             //////////////// Build GrowingBuffer ////////////////
+            growingBufferInit<<<1,1>>>(result);
+            cudaDeviceSynchronize();
+
             growingBufferFill<<<numBlocks, numThreadsInBlock, sharedMemSizeGrowingBuf>>>(d_input_cols, numPredColumns, arraySizeElems, result);
             cudaDeviceSynchronize();
             //////////////// Build GrowingBuffer ////////////////
@@ -1140,7 +1142,7 @@ int main(int argc, char* argv[]) {
             // buildPreAggregationHashtableFragments<<<numBlocks,numThreadsInBlockPreAggr,getSharedMemorySize()>>>(d_input_cols, numPredColumns, arraySizeElems, result_view, allOutputs_d, outputsSizes_d);
             //
             // 1024-128 due to high register usage
-            buildPreAggregationHashtableFragmentsAdvanced<<<numBlocks,numThreadsInBlockPreAggr>>>(d_input_cols, numPredColumns, arraySizeElems, result_view, allOutputs_d, outputsSizes_d);
+            buildPreAggregationHashtableFragmentsAdvanced<<<numBlocks,256>>>(d_input_cols, numPredColumns, arraySizeElems, result_view, allOutputs_d, outputsSizes_d);
             cudaDeviceSynchronize();
             t = cudaGetLastError();
             CHECK_CUDA_ERROR(t);
@@ -1162,27 +1164,30 @@ int main(int argc, char* argv[]) {
             }
             // std::cout << "[Merge HT FRAGMENTS] Total size = " << totalSum << ", num fragments " << numFragments << "\n";
             CHECK_CUDA_ERROR(cudaMemcpy(preAllocatedPartitions_d, preAllocatedPartitions_h, sizeof(PreAggregationHashtable::PartitionHt) * 64, cudaMemcpyHostToDevice));
-            dim3 dimBlock(64);  // Cooperative launch, use (1, 1, 1) for block dimensions
-            dim3 dimGrid(64);   // Set grid dimensions according to your problem size
+            // dim3 dimBlock(64);  // Cooperative launch, use (1, 1, 1) for block dimensions
+            // dim3 dimGrid(64);   // Set grid dimensions according to your problem size
 
-            // Prepare kernel arguments
-            void* kernelArgs[] = {
-                &result_preAggrHT,
-                &preAllocatedPartitions_d,
-                &allOutputs_d,
-                (void*)&numFragments
-            };
+            // // Prepare kernel arguments
+            // void* kernelArgs[] = {
+            //     &result_preAggrHT,
+            //     &preAllocatedPartitions_d,
+            //     &allOutputs_d,
+            //     (void*)&numFragments
+            // };
 
-            // Launch the kernel using cudaLaunchCooperativeKernel
-            cudaError_t err = cudaLaunchCooperativeKernel(
-                (void*)mergePreAggregationHashtableFragmentsSingleThread,  // Kernel function pointer
-                dimGrid,    // Grid dimensions
-                dimBlock,   // Block dimensions
-                kernelArgs  // Array of kernel arguments
-            );
+            // // Launch the kernel using cudaLaunchCooperativeKernel
+            // cudaError_t err = cudaLaunchCooperativeKernel(
+            //     (void*)mergePreAggregationHashtableFragmentsSingleThread,  // Kernel function pointer
+            //     dimGrid,    // Grid dimensions
+            //     dimBlock,   // Block dimensions
+            //     kernelArgs  // Array of kernel arguments
+            // );
+            // cudaDeviceSynchronize();
+            INITPreAggregationHashtableFragmentsSingleThread<<<1,1>>>(result_preAggrHT, preAllocatedPartitions_d);
             cudaDeviceSynchronize();
-            // INITPreAggregationHashtableFragmentsSingleThread<<<1,1>>>(result_preAggrHT, preAllocatedPartitions_d);
-            // mergePreAggregationHashtableFragmentsSingleThread<<<64,1>>>(result_preAggrHT, preAllocatedPartitions_d, allOutputs_d, numFragments, eqInt, combineInt);
+
+            mergePreAggregationHashtableFragmentsSingleThread<<<256,512>>>(result_preAggrHT, preAllocatedPartitions_d, allOutputs_d, numFragments);
+            cudaDeviceSynchronize();
             if(numbersThreshold==10){
                 printPreAggregationHashtable<<<1,1>>>(result_preAggrHT, false);
             }

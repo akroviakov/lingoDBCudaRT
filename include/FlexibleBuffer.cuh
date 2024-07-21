@@ -139,7 +139,9 @@ __device__ __forceinline__ void* memAlloc(int numBytes){
     #else
     result = malloc(numBytes);
     #endif
-    assert(result);
+    // if(!result){
+    //     printf("[ERROR] memAlloc returned nullptr!\n");
+    // }
     return result;
 }
 
@@ -340,9 +342,13 @@ __device__ uint8_t* FlexibleBuffer::insert() {
 }
 
 __device__ uint8_t* FlexibleBuffer::prepareWriteFor(const int numElems) {
+    // int active = __popc(__match_any_sync(__activemask(), (unsigned long long)this));
+    // if(active != 1){
+    //     printf("[DATA RACE] [TID=%d, WID=%d][This=%p], threads active for this FlexiBuf: %d, writing %d elems \n", threadIdx.x, threadIdx.x/32, this, active, numElems);
+    // }
     // printf("[%p]buffers.count %d == 0  || buffers.back().numElements %d + numElems %d >=  currCapacity %d \n", &buffers.back(), buffers.count, buffers.back().numElements, numElems, currCapacity);
     if (buffers.count == 0 || buffers.back().numElements + numElems >= currCapacity) {
-        // printf("[%p]WOW buffers.count %d == 0  || buffers.back().numElements %d + numElems %d >=  currCapacity %d \n", &buffers.back(), buffers.count, buffers.back().numElements, numElems, currCapacity);
+        // printf("[%d][%p]WOW buffers.count %d == 0  || buffers.back().numElements %d + numElems %d >=  currCapacity %d \n", __popc(__activemask()), &buffers.back(), buffers.count, buffers.back().numElements, numElems, currCapacity);
         nextBuffer();
     }
     totalLen += numElems;

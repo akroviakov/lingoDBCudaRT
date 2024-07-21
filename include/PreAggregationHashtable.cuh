@@ -10,6 +10,96 @@
 #include <cstddef>
 #include <cstdint>
 
+class PreAggregationHashtableFragmentSMEM {
+    public:
+    struct Entry {
+        Entry* next;
+        size_t hashValue;
+        uint8_t content[];
+        //kv follows
+    };
+    static constexpr size_t numOutputs = 64;
+    static constexpr size_t outputMask = numOutputs - 1;
+    static constexpr size_t htShift = 6; //2^6=64
+
+    size_t hashtableSize = 1024;
+    size_t htMask = hashtableSize - 1;
+
+    Entry** ht;
+    size_t typeSize;
+    size_t len;
+    volatile int x;
+
+    FlexibleBuffer* outputs[numOutputs];
+    __device__ PreAggregationHashtableFragmentSMEM(size_t typeSize, Entry** ht_cache, size_t hashtableSize) : hashtableSize(hashtableSize), htMask(hashtableSize-1), ht(ht_cache), typeSize(typeSize), len(0), outputs() {}  
+
+    __device__ Entry* insert(size_t hash, const int warpThreadsInsertMask) {
+        const int threadIdxInWarp = threadIdx.x % warpSize;
+        const size_t outputIdx = hash & outputMask;
+        // Are there any threads in THIS warp inserting to the same partition?
+        // acquire_lock(&x); // {key=6117,val=12234,hash=176388750,next=(nil)},
+        // const int maskThisHashTableFram = __match_any_sync(warpThreadsInsertMask, (unsigned long long)this); // Check if the instruction refers to the same fragment
+        const int maskSamePartition = __match_any_sync(warpThreadsInsertMask, (unsigned long long)outputIdx); // Check if the warp threads write to the same partition
+        const int leader = __ffs(maskSamePartition) - 1; // For all those writing to the same partition, only one will do allocations, etc.
+        Entry* newEntry{nullptr};
+        const int warpOffset = __popc(maskSamePartition & ((1 << threadIdxInWarp) - 1)); // Each thread should know its offset for the retrieved pointer
+        if(threadIdxInWarp == leader){
+            const int numMatching = __popc(maskSamePartition); // How many threads write to the same partition
+            atomicAdd((unsigned long long*)&len,(unsigned long long)numMatching);
+            // Warp-level PreAggHTFrag ensures that no other warp tries to write to the same outputIdx, so we are safe here (1 leader per PreAggHTFrag).
+            // If we were to hoist PreAggHTFrag to thread-block level, we'd need a CAS loop to wait until a leader of some other warp finished output[outputIdx] allocation.
+            if (!outputs[outputIdx]) { 
+                outputs[outputIdx] = (FlexibleBuffer*)memAlloc(sizeof(FlexibleBuffer));
+                new (outputs[outputIdx]) FlexibleBuffer(256, typeSize, true);
+            }
+            // printf("BEF [TID %d][outIdx %lu][Buf %p][NumToWrite %d][warpOffset %d] buffers.back().numElements is %d\n", threadIdx.x, outputIdx, &outputs[outputIdx]->buffers.back(), numMatching, warpOffset, outputs[outputIdx]->buffers.back().numElements);
+            newEntry = reinterpret_cast<Entry*>(outputs[outputIdx]->prepareWriteFor(numMatching));
+            // printf("[%d] New entry %p\n",__popc(maskSamePartition & __activemask()), newEntry);
+            // printf("AFT [TID %d][outIdx %lu][Buf %p][NumToWrite %d][warpOffset %d] buffers.back().numElements is %d\n", threadIdx.x, outputIdx, &outputs[outputIdx]->buffers.back(), numMatching, warpOffset, outputs[outputIdx]->buffers.back().numElements);
+        }
+        uint8_t* bytePtr = reinterpret_cast<uint8_t*>(__shfl_sync(maskSamePartition, (unsigned long long)newEntry, leader));
+        newEntry = reinterpret_cast<Entry*>(&bytePtr[warpOffset*typeSize]) ;
+        newEntry->hashValue = hash;
+        newEntry->next = nullptr;
+        // release_lock(&x);
+        // TODO: if threads try to write matching hash AND key, only the last write survives for further aggregations, all others retire immediately without any aggregation. 
+        
+        // atomicExch((unsigned long long*)&ht[hash >> htShift & htMask], (unsigned long long)newEntry);
+        // Move actual insert out as the entry is getting inserted in the shared structure in its "uninitialized" state, we don't want that, let the compile side initialize and actually insert it.
+        return newEntry; 
+    }
+
+    __device__ ~PreAggregationHashtableFragmentSMEM(){
+        for(size_t i=0;i<numOutputs;i++){
+            if(outputs[i]){
+                outputs[i]->~FlexibleBuffer();
+                freePtr(outputs[i]);
+            }
+        }
+    }
+
+    __device__ void print( void (*printEntry)(uint8_t*) = nullptr){
+        printf("--------------------PreAggregationHashtableFragmentSMEM [%p]--------------------\n", this);
+        size_t countValidPartitions{0};
+        size_t countFlexibleBufferLen{0};
+        for(int i = 0; i < numOutputs; i++){
+            countValidPartitions += (outputs[i] != nullptr);
+        }
+        printf("typeSize=%lu, len=%lu, %lu non-empty partitions out of %lu\n", typeSize, len, countValidPartitions, numOutputs);
+        for(int i = 0; i < numOutputs; i++){
+            if(outputs[i]){
+                printf("[Partition %d] ", i);
+                outputs[i]->print(printEntry);
+                countFlexibleBufferLen += outputs[i]->getLen();
+                printf("[END Partition %d] \n", i);
+            }
+        }
+        if(countFlexibleBufferLen != len){
+            printf("[ERROR] aggregated FlexibleBuffer lengths (%lu) and Fragment's length (%lu)\n", countFlexibleBufferLen, len);
+        }
+        printf("---------------[END] PreAggregationHashtableFragmentSMEM [%p]--------------------\n", this);
+    }
+};
 class PreAggregationHashtableFragment {
     public:
     struct Entry {
