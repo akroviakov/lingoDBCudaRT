@@ -66,6 +66,63 @@ enum class HashIndexedViewBuilderType{
     BufferToGPU = 2
 };
 
+__global__ void growingBufferFillTB(int** input, int numPredColumns, int size, GrowingBuffer* finalBuffer) {
+    const int warp_count = (blockDim.x + (warp_size-1)) / warp_size;
+    const int numThreadsTotal = blockDim.x * gridDim.x;
+    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
+    const int lane = threadIdx.x % warp_size;
+    const int warpId = threadIdx.x / warp_size;
+
+    extern __shared__ char sharedMem[];
+    // Ensure correct memory alignment
+    GrowingBuffer* myBuf = reinterpret_cast<GrowingBuffer*>(sharedMem);
+    uint64_t* counter = reinterpret_cast<uint64_t*>(sharedMem + sizeof(GrowingBuffer));
+    HashIndexedViewEntry** writeCursor = reinterpret_cast<HashIndexedViewEntry**>(sharedMem + sizeof(GrowingBuffer) + sizeof(uint64_t));
+
+    if (threadIdx.x == 0) {
+        new (myBuf) GrowingBuffer(initialCapacity, typeSize);
+        *counter = 0;  // Initialize the counter
+    }
+    __syncthreads();
+    uint64_t myIdx = 0;
+
+    int roundedSize = ((size + 31) / 32) * 32;
+    for (int i = globalTid; i < roundedSize; i += numThreadsTotal) {
+        bool pred = (i < size);
+        int colIdx = 0;
+        // while (pred && colIdx < numPredColumns) {
+            pred &= (input[colIdx][i] < LTPredicate);
+            // colIdx++;
+        // }
+        const int maskWriters = __ballot_sync(0xFFFFFFFF, pred);
+        if(!lane){
+            myIdx = atomicAdd((unsigned long long*)counter, (unsigned long long)__popc(maskWriters));
+        }
+        myIdx = __shfl_sync(maskWriters, myIdx, 0);
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            *writeCursor = (HashIndexedViewEntry*)myBuf->getValues().prepareWriteFor(*counter);
+            *counter = 0;
+        }
+        __syncthreads();
+        if (pred) {
+            HashIndexedViewEntry* writeTo= *writeCursor;
+            writeTo[myIdx].key = input[0][i];
+            writeTo[myIdx].hashValue = hashInt32(writeTo[myIdx].key);
+            writeTo[myIdx].value = input[0][i];
+            writeTo[myIdx].nullFlag = false;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        acquire_lock(&globalLock);
+        finalBuffer->getValues().merge(myBuf->getValues());
+        __threadfence();
+        release_lock(&globalLock);
+    }
+}
 __global__ void growingBufferInit(GrowingBuffer* finalBuffer) {
     if(blockDim.x * blockIdx.x + threadIdx.x == 0){
         new(finalBuffer) GrowingBuffer(initialCapacity, typeSize, false);
@@ -88,10 +145,10 @@ __global__ void growingBufferFill(int** input, int numPredColumns, int size, Gro
     for (int i = globalTid; i < roundedSize; i += numThreadsTotal) {
         bool pred{i < size};
         int colIdx=0;
-        while(pred && colIdx < numPredColumns){
+        // while(pred && colIdx < numPredColumns){
             pred &= (input[colIdx][i] < LTPredicate);
-            colIdx++;
-        }
+            // colIdx++;
+        // }
         // TODO: revisit (see FlexibleBuffer::insertWarpLevel())
         // if (pred) {
         //     HashIndexedViewEntry* writeCursor = (HashIndexedViewEntry*) currentWarpBuffer->getValues().insertWarpLevel();
@@ -1088,7 +1145,7 @@ int main(int argc, char* argv[]) {
             growingBufferInit<<<1,1>>>(result);
             cudaDeviceSynchronize();
 
-            growingBufferFill<<<numBlocks, numThreadsInBlock, sharedMemSizeGrowingBuf>>>(d_input_cols, numPredColumns, arraySizeElems, result);
+            growingBufferFillTB<<<numBlocks, numThreadsInBlock, sharedMemSizeGrowingBuf>>>(d_input_cols, numPredColumns, arraySizeElems, result);
             cudaDeviceSynchronize();
             //////////////// Build GrowingBuffer ////////////////
             cudaEventRecord(stop, 0);
