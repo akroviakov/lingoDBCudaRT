@@ -15,6 +15,8 @@ class GrowingBuffer {
    //  __device__ static void destroy(GrowingBuffer* vec);
     __device__ void merge(GrowingBuffer* other);
     __device__ void merge(GrowingBuffer& other);
+    __device__ void merge(LeafFlexibleBuffer* other);
+
     __host__ __device__ FlexibleBuffer& getValues() { return values; }
 };
 
@@ -36,5 +38,10 @@ __device__ void GrowingBuffer::merge(GrowingBuffer* other) {
 __device__ void GrowingBuffer::merge(GrowingBuffer& other) {
    values.merge(other.values);
 }
+
+__device__ void GrowingBuffer::merge(LeafFlexibleBuffer* other) {
+   values.merge(other);
+}
+
 
 #endif // GROWINGBUFFER_H

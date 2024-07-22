@@ -52,6 +52,11 @@ struct HashIndexedViewEntry {
     int32_t value;
 };
 
+__device__ void printEntry(uint8_t* entryPtr){
+    HashIndexedViewEntry* structPtr = reinterpret_cast<HashIndexedViewEntry*>(entryPtr);
+    printf("{key=%d,val=%d,hash=%llu,next=%p},", structPtr->key, structPtr->value, structPtr->hashValue, structPtr->next);
+}
+
 constexpr int typeSize = sizeof(HashIndexedViewEntry);
 constexpr int warp_size = 32;
 
@@ -66,7 +71,7 @@ enum class HashIndexedViewBuilderType{
     BufferToGPU = 2
 };
 
-__global__ void growingBufferFillTB(int** input, int numPredColumns, int size, GrowingBuffer* finalBuffer) {
+__global__ void growingBufferFillTBHeap(int** input, int numPredColumns, int size, GrowingBuffer* finalBuffer) {
     const int warp_count = (blockDim.x + (warp_size-1)) / warp_size;
     const int numThreadsTotal = blockDim.x * gridDim.x;
     const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
@@ -89,16 +94,17 @@ __global__ void growingBufferFillTB(int** input, int numPredColumns, int size, G
     int roundedSize = ((size + 31) / 32) * 32;
     for (int i = globalTid; i < roundedSize; i += numThreadsTotal) {
         bool pred = (i < size);
-        int colIdx = 0;
         // while (pred && colIdx < numPredColumns) {
-            pred &= (input[colIdx][i] < LTPredicate);
+        if(pred){
+            pred &= (input[0][i] < LTPredicate);
+        }
             // colIdx++;
         // }
         const int maskWriters = __ballot_sync(0xFFFFFFFF, pred);
         if(!lane){
             myIdx = atomicAdd((unsigned long long*)counter, (unsigned long long)__popc(maskWriters));
         }
-        myIdx = __shfl_sync(maskWriters, myIdx, 0);
+        myIdx = __shfl_sync(maskWriters, myIdx, 0) + __popc(maskWriters & ((1U << lane) - 1));;
         __syncthreads();
 
         if (threadIdx.x == 0) {
@@ -123,6 +129,61 @@ __global__ void growingBufferFillTB(int** input, int numPredColumns, int size, G
         release_lock(&globalLock);
     }
 }
+
+__global__ void growingBufferFillTB(int** input, int numPredColumns, int size, GrowingBuffer* finalBuffer) {
+    const int warp_count = (blockDim.x + (warp_size-1)) / warp_size;
+    const int numThreadsTotal = blockDim.x * gridDim.x;
+    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
+    const int lane = threadIdx.x % warp_size;
+    const int warpId = threadIdx.x / warp_size;
+
+    __shared__ char sharedMem[2048];
+    LeafFlexibleBuffer* myBuf = reinterpret_cast<LeafFlexibleBuffer*>(sharedMem);
+    HashIndexedViewEntry** writeCursor = reinterpret_cast<HashIndexedViewEntry**>(sharedMem + sizeof(LeafFlexibleBuffer));
+    uint64_t* counter = reinterpret_cast<uint64_t*>(sharedMem + sizeof(LeafFlexibleBuffer) + sizeof(HashIndexedViewEntry**));
+
+    if (threadIdx.x == 0) {
+        new (myBuf) LeafFlexibleBuffer(initialCapacity, typeSize, false);
+        *counter = 0;
+    }
+    __syncthreads();
+    uint32_t myIdx = 0;
+
+    int roundedSize = ((size + 31) / 32) * 32;
+    for (int i = globalTid; i < roundedSize; i += numThreadsTotal) {
+        bool pred = (i < size);
+        if(pred){
+            pred &= (input[0][i] < LTPredicate);
+        }
+        const int maskWriters = __ballot_sync(0xFFFFFFFF, pred);
+        if(!lane){
+            myIdx = atomicAdd((unsigned long long*)counter, (unsigned long long)__popc(maskWriters));
+        }
+        myIdx = __shfl_sync(maskWriters, myIdx, 0) + __popc(maskWriters & ((1U << lane) - 1));
+        __syncthreads();
+        if (threadIdx.x == 0) { // Critical section, try to reduce time (e.g., increase SMEM usage).
+            *writeCursor = (HashIndexedViewEntry*)myBuf->prepareWriteFor(*counter);
+            *counter = 0;
+        }
+        __syncthreads();
+        if (pred) {
+            HashIndexedViewEntry* writeTo= *writeCursor;
+            writeTo[myIdx].key = input[0][i];
+            writeTo[myIdx].hashValue = hashInt32(writeTo[myIdx].key);
+            writeTo[myIdx].value = input[0][i];
+            writeTo[myIdx].nullFlag = false;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        acquire_lock(&globalLock);
+        finalBuffer->getValues().merge(myBuf);
+        __threadfence();
+        release_lock(&globalLock);
+    }
+}
+
 __global__ void growingBufferInit(GrowingBuffer* finalBuffer) {
     if(blockDim.x * blockIdx.x + threadIdx.x == 0){
         new(finalBuffer) GrowingBuffer(initialCapacity, typeSize, false);
@@ -146,7 +207,9 @@ __global__ void growingBufferFill(int** input, int numPredColumns, int size, Gro
         bool pred{i < size};
         int colIdx=0;
         // while(pred && colIdx < numPredColumns){
-            pred &= (input[colIdx][i] < LTPredicate);
+        if(pred){
+            pred &= (input[0][i] < LTPredicate);
+        }
             // colIdx++;
         // }
         // TODO: revisit (see FlexibleBuffer::insertWarpLevel())
@@ -204,10 +267,7 @@ __global__ void printHashIndexedView(HashIndexedView* view) {
     view->print();
 }
 
-__device__ void printEntry(uint8_t* entryPtr){
-    HashIndexedViewEntry* structPtr = reinterpret_cast<HashIndexedViewEntry*>(entryPtr);
-    printf("{key=%d,val=%d,hash=%llu,next=%p},", structPtr->key, structPtr->value, structPtr->hashValue, structPtr->next);
-}
+
 
 __global__ void printPreAggregationHashtable(PreAggregationHashtable* ht, bool printEmpty=false) {
     printf("---------------------PreAggregationHashtable [%p]-------------------------\n", ht);
@@ -353,7 +413,7 @@ __global__ void buildHashIndexedViewAdvancedSMEMWarpLevel(GrowingBuffer* buffer,
     }
 
     __syncwarp();
-    for(int i=warpLane; i < warpSubHtSize;i+=blockDim.x){
+    for(int i=warpLane; i < warpSubHtSize;i+=blockDim.x/32){
         if(myScratchPadStart[i].head){
             atomicAppendSubList(view->ht, myScratchPadStart[i].writeOutPos, myScratchPadStart[i].head, myScratchPadStart[i].tail);
             // printf("[FINAL] SUBCHAIN LENGTH %d\n", scracthPad[i].chainLength);
@@ -1144,8 +1204,10 @@ int main(int argc, char* argv[]) {
             //////////////// Build GrowingBuffer ////////////////
             growingBufferInit<<<1,1>>>(result);
             cudaDeviceSynchronize();
+            // growingBufferFillTBHeap<<<numBlocks, numThreadsInBlock, sharedMemSizeGrowingBuf>>>(d_input_cols, numPredColumns, arraySizeElems, result);
+            growingBufferFillTB<<<numBlocks, numThreadsInBlock>>>(d_input_cols, numPredColumns, arraySizeElems, result);
+            // growingBufferFill<<<numBlocks, numThreadsInBlock, sharedMemSizeGrowingBuf>>>(d_input_cols, numPredColumns, arraySizeElems, result);
 
-            growingBufferFillTB<<<numBlocks, numThreadsInBlock, sharedMemSizeGrowingBuf>>>(d_input_cols, numPredColumns, arraySizeElems, result);
             cudaDeviceSynchronize();
             //////////////// Build GrowingBuffer ////////////////
             cudaEventRecord(stop, 0);

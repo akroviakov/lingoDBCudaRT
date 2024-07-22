@@ -7,6 +7,31 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#ifdef GALLATIN_ENABLED
+#include <gallatin/allocators/global_allocator.cuh>
+#endif
+
+__device__ __forceinline__ void* memAlloc(int numBytes){
+    void* result = nullptr;
+    #ifdef GALLATIN_ENABLED
+    result = gallatin::allocators::global_malloc(numBytes);
+    #else
+    result = malloc(numBytes);
+    #endif
+    // if(!result){
+    //     printf("[ERROR] memAlloc returned nullptr!\n");
+    // }
+    return result;
+}
+
+__device__ __forceinline__ void freePtr(void* ptr){
+    #ifdef GALLATIN_ENABLED
+    gallatin::allocators::global_free(ptr);
+    #else
+    free(ptr);
+    #endif
+}
+
 enum class Counter{VectorExpansionMalloc = 0, NextBufferMalloc, InitBufferMalloc, Free};
 int counters[4];
 __device__ int deviceCounters[4];
@@ -17,28 +42,66 @@ struct Buffer {
     bool own{true};
 };
 
-template<typename T, size_t Capacity>
-struct Array {
+struct LeafBufferArray {
+    // A single thread block won't create > 2^50 buffers
+    static constexpr uint8_t capacity{50}; 
+    Buffer staticPayLoad[capacity];
     uint32_t size{0};
-    T staticPayLoad[Capacity];
-    __device__ Array(T* input, size_t size = Capacity){
-        memcpy(staticPayLoad, input, sizeof(T) * size);
-    }
-    __device__ void push_back(const T& elem){
-        assert(size != Capacity);
+    __device__ LeafBufferArray(){}
+
+    __device__ void push_back(const Buffer& elem){
+        assert(size != capacity);
         staticPayLoad[size++] = elem;
     }
 
-    __device__ T& back(){
+    __device__ Buffer& back(){
         return staticPayLoad[size-1];
     }
 
-    __device__ __host__ T& operator[](uint32_t index) {
+    __device__ __host__ Buffer& operator[](uint32_t index) {
         assert(index < size);
         return staticPayLoad[index];
     }
 };
 
+class LeafFlexibleBuffer {
+    int typeSize;
+    __device__ void nextBuffer() {
+        int nextCapacity = currCapacity * 2;
+        uint8_t* ptr = (uint8_t*) memAlloc(nextCapacity * typeSize);
+        buffers.push_back(Buffer{ptr, 0});
+        // atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::NextBufferMalloc)], 1);
+        currCapacity = nextCapacity;
+    }
+    public:
+    int totalLen;
+    int currCapacity;
+    LeafBufferArray buffers;
+
+    __device__ LeafFlexibleBuffer(int initialCapacity, int typeSize, bool alloc = true) : totalLen(0), currCapacity(initialCapacity), typeSize(typeSize) {
+        if (alloc) {
+            // atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::InitBufferMalloc)], 1);
+            uint8_t* ptr = (uint8_t*) memAlloc(initialCapacity * typeSize);
+            buffers.push_back(Buffer{ptr, 0});
+        }
+    }
+
+    __device__ LeafFlexibleBuffer(int initialCapacity, int typeSize, Buffer& firstBuf) : totalLen(firstBuf.numElements), currCapacity(initialCapacity), typeSize(typeSize){
+        buffers.push_back(firstBuf);
+    }
+
+    __host__ __device__ int getLen() const { return totalLen; }
+    __device__ int getTypeSize() const { return typeSize; }
+    __device__ uint8_t* prepareWriteFor(const int numElems){
+        if (buffers.size == 0 || buffers.back().numElements + numElems >= currCapacity) {
+            nextBuffer();
+        }
+        totalLen += numElems;
+        auto* res = &buffers.back().ptr[typeSize * (buffers.back().numElements)];
+        buffers.back().numElements += numElems;
+        return res;
+    }
+};
 // class StaticBuffer {
 //     int totalLen;
 //     int currCapacity;
@@ -128,30 +191,7 @@ struct Array {
 //     }
 // };
 
-#ifdef GALLATIN_ENABLED
-#include <gallatin/allocators/global_allocator.cuh>
-#endif
 
-__device__ __forceinline__ void* memAlloc(int numBytes){
-    void* result = nullptr;
-    #ifdef GALLATIN_ENABLED
-    result = gallatin::allocators::global_malloc(numBytes);
-    #else
-    result = malloc(numBytes);
-    #endif
-    // if(!result){
-    //     printf("[ERROR] memAlloc returned nullptr!\n");
-    // }
-    return result;
-}
-
-__device__ __forceinline__ void freePtr(void* ptr){
-    #ifdef GALLATIN_ENABLED
-    gallatin::allocators::global_free(ptr);
-    #else
-    free(ptr);
-    #endif
-}
 
 template<typename T>
 struct Vec {
@@ -162,6 +202,14 @@ struct Vec {
     __device__ ~Vec();
     __device__ void grow();
     __device__ void merge(Vec<T>& other);
+    __device__ void merge(LeafBufferArray& other){
+        for (int i = 0; i < other.size; i++) {
+            if (other.staticPayLoad) {
+                push_back(other.staticPayLoad[i]); 
+            }
+        }
+        other.size = 0;
+    }
 
     __device__ void push_back(const T& elem){
         if(count == capacity){
@@ -216,6 +264,13 @@ public:
         other->currCapacity = 0;
     }
 
+    __device__ void merge(LeafFlexibleBuffer* other) {
+        buffers.merge(other->buffers);
+        totalLen += other->totalLen;
+        other->totalLen = 0;
+    }
+
+
     __host__ __device__ int getLen() const {
         return totalLen;
     }
@@ -248,8 +303,7 @@ __device__ Vec<T>::Vec() {
     count = 0;
     capacity = 32 * 32;
     payLoad = (T*) memAlloc(capacity * sizeof(T));
-    assert(payLoad);
-    atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::VectorExpansionMalloc)], 1);
+    // atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::VectorExpansionMalloc)], 1);
 }
 
 template<typename T>
@@ -264,16 +318,14 @@ template<typename T>
 __device__ void Vec<T>::grow() {
     capacity *= 2;
     T* newPayLoad = (T*) memAlloc(capacity * sizeof(T));
-    assert(newPayLoad);
-    atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::VectorExpansionMalloc)], 1);
+    // atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::VectorExpansionMalloc)], 1);
 
     for (int i = 0; i < count; ++i) {
         newPayLoad[i] = payLoad[i];
     }
     if (payLoad != nullptr) {
-        // free(payLoad);
         freePtr(payLoad);
-        atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::Free)], 1);
+        // atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::Free)], 1);
     }
     payLoad = newPayLoad;
 }
@@ -289,7 +341,7 @@ __device__ void Vec<T>::merge(Vec<T>& other) {
     other.capacity = 0;
     if (other.payLoad) {
         freePtr(other.payLoad);
-        atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::Free)], 1);
+        // atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::Free)], 1);
         other.payLoad = nullptr;
     }
 }
@@ -297,9 +349,8 @@ __device__ void Vec<T>::merge(Vec<T>& other) {
 __device__ FlexibleBuffer::FlexibleBuffer(int initialCapacity, int typeSize, bool alloc)
     : totalLen(0), currCapacity(initialCapacity), typeSize(typeSize) {
     if (alloc) {
-        atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::InitBufferMalloc)], 1);
+        // atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::InitBufferMalloc)], 1);
         uint8_t* ptr = (uint8_t*) memAlloc(initialCapacity * typeSize);
-        assert(ptr);
         buffers.push_back(Buffer{ptr, 0});
     }
 }
@@ -358,21 +409,20 @@ __device__ uint8_t* FlexibleBuffer::prepareWriteFor(const int numElems) {
 }
 
 __device__ FlexibleBuffer::~FlexibleBuffer() {
-    for (int i = 0; i < buffers.count; ++i) {
-        if (buffers.payLoad[i].ptr) {
-            freePtr(buffers.payLoad[i].ptr);
-            atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::Free)], 1);
-        }
-    }
+    // for (int i = 0; i < buffers.count; ++i) {
+    //     if (buffers.payLoad[i].ptr) {
+    //         freePtr(buffers.payLoad[i].ptr);
+    //         atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::Free)], 1);
+    //     }
+    // }
 }
 
 __device__ void FlexibleBuffer::nextBuffer() {
     int nextCapacity = currCapacity * 2;
     // (uint8_t*) malloc(nextCapacity * typeSize);
     uint8_t* ptr = (uint8_t*) memAlloc(nextCapacity * typeSize);
-    assert(ptr);
     buffers.push_back(Buffer{ptr, 0});
-    atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::NextBufferMalloc)], 1);
+    // atomicAdd((int*)&deviceCounters[static_cast<int>(Counter::NextBufferMalloc)], 1);
     currCapacity = nextCapacity;
 }
 #endif // FLEXIBLEBUFFER_H
