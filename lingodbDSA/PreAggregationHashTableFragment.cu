@@ -30,12 +30,12 @@ constexpr size_t heapSize = 3 * GiB;
 
 constexpr int initialCapacity = INITIAL_CAPACITY;
 constexpr float selectivity = 0.8;
-constexpr int numbersThreshold = 10;
+constexpr int numbersThreshold = 10000;
 constexpr int LTPredicate = (int)numbersThreshold * selectivity;
 __device__ volatile int globalLock = 0;
 
 
-__device__ uint32_t hashInt32(int32_t key) {
+__device__ __forceinline__ uint32_t hashInt32(int32_t key) {
     key ^= key >> 16;
     key *= 0x85ebca6b;
     key ^= key >> 13;
@@ -140,7 +140,7 @@ __global__ void growingBufferFillTB(int** input, int numPredColumns, int size, G
     __shared__ char sharedMem[2048];
     LeafFlexibleBuffer* myBuf = reinterpret_cast<LeafFlexibleBuffer*>(sharedMem);
     HashIndexedViewEntry** writeCursor = reinterpret_cast<HashIndexedViewEntry**>(sharedMem + sizeof(LeafFlexibleBuffer));
-    uint64_t* counter = reinterpret_cast<uint64_t*>(sharedMem + sizeof(LeafFlexibleBuffer) + sizeof(HashIndexedViewEntry**));
+    uint32_t* counter = reinterpret_cast<uint32_t*>(sharedMem + sizeof(LeafFlexibleBuffer) + sizeof(HashIndexedViewEntry**));
 
     if (threadIdx.x == 0) {
         new (myBuf) LeafFlexibleBuffer(initialCapacity, typeSize, false);
@@ -153,25 +153,25 @@ __global__ void growingBufferFillTB(int** input, int numPredColumns, int size, G
     for (int i = globalTid; i < roundedSize; i += numThreadsTotal) {
         bool pred = (i < size);
         if(pred){
-            pred &= (input[0][i] < LTPredicate);
+            pred &= (input[0][i] < LTPredicate); // Global load stalls (long scoreboard, memory latency)
         }
         const int maskWriters = __ballot_sync(0xFFFFFFFF, pred);
         if(!lane){
-            myIdx = atomicAdd((unsigned long long*)counter, (unsigned long long)__popc(maskWriters));
+            myIdx = atomicAdd(counter, __popc(maskWriters)); // Shared load, heavy inst
         }
-        myIdx = __shfl_sync(maskWriters, myIdx, 0) + __popc(maskWriters & ((1U << lane) - 1));
+        myIdx = __shfl_sync(maskWriters, myIdx, 0) + __popc(maskWriters & ((1U << lane) - 1)); // barrier stalls
         __syncthreads();
         if (threadIdx.x == 0) { // Critical section, try to reduce time (e.g., increase SMEM usage).
             *writeCursor = (HashIndexedViewEntry*)myBuf->prepareWriteFor(*counter);
             *counter = 0;
         }
         __syncthreads();
-        if (pred) {
-            HashIndexedViewEntry* writeTo= *writeCursor;
-            writeTo[myIdx].key = input[0][i];
-            writeTo[myIdx].hashValue = hashInt32(writeTo[myIdx].key);
-            writeTo[myIdx].value = input[0][i];
-            writeTo[myIdx].nullFlag = false;
+        if (pred) { // Uncoalesced stores
+            HashIndexedViewEntry* writeTo= *writeCursor; // Shared load
+            writeTo[myIdx].key = input[0][i]; // Global 2 loads, 1 store (LG throttle: L2 can't keep up)
+            writeTo[myIdx].hashValue = hashInt32(writeTo[myIdx].key); // Global store
+            writeTo[myIdx].value = input[0][i]; // Global 2 loads, 1 store (many stalls)
+            writeTo[myIdx].nullFlag = false; // Global store (low impact, 1 byte)
         }
     }
     __syncthreads();
@@ -290,7 +290,7 @@ __global__ void printPreAggregationHashtable(PreAggregationHashtable* ht, bool p
 struct HIVEntry{
     HashIndexedView::Entry* head{nullptr};
     HashIndexedView::Entry* tail{nullptr};
-    int64_t writeOutPos{-1};
+    int64_t writeOutPos{-1}; // we mask it 
     // size_t chainLength{0};
 };
 
@@ -299,24 +299,26 @@ __device__ void atomicAppendSubList(HashIndexedView::Entry** globalHt, const siz
         HashIndexedView::Entry* subListTail) {
     HashIndexedView::Entry* currentHead = globalHt[pos];
     HashIndexedView::Entry* old = currentHead;
+    const uint64_t hash = subListHead->hashValue; // global load
     do {
         currentHead = old;
         if(subListHead != subListTail){ // We set tail to head on the first write to head, if they do not match -> sub-list length > 1, need to adjust tail
             subListTail->next = currentHead; 
         } else // if subListHead is not different from tail -> sub-list length 1, only adjust head
             subListHead->next = currentHead; 
-        subListHead = tag(subListHead, currentHead, subListHead->hashValue);
+        subListHead = tag(subListHead, currentHead, hash);
         old = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[pos], (unsigned long long)currentHead, (unsigned long long)subListHead);
     } while (old != currentHead);
 }
 
 __device__ __forceinline__ void atomicAppendSMEM(HIVEntry* globalHt, const size_t pos, HashIndexedView::Entry* newNode) {
-    HashIndexedView::Entry* currentHead = globalHt[pos].head;
+    HashIndexedView::Entry* currentHead = globalHt[pos].head; // shared load
     HashIndexedView::Entry* old = currentHead;
+    const uint64_t hash = newNode->hashValue; // global load (scoreboard stalls)
     do {
         currentHead = old;
-        newNode->next = currentHead; 
-        newNode = tag(newNode, currentHead, newNode->hashValue);
+        newNode->next = currentHead;  // global store
+        newNode = tag(newNode, currentHead, hash);
         old = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[pos].head, (unsigned long long)currentHead, (unsigned long long)newNode);
     } while (old != currentHead);
     if(!old) { // We executed the first write (meaning head was nullptr before): set tail to head. No other write to this head would update it anymore -> thread safe.
@@ -324,15 +326,26 @@ __device__ __forceinline__ void atomicAppendSMEM(HIVEntry* globalHt, const size_
     }
 }
 
+
 __device__ __forceinline__ void atomicAppend(HashIndexedView::Entry** globalHt, const size_t pos, HashIndexedView::Entry* newNode) {
-    HashIndexedView::Entry* currentHead = globalHt[pos];
-    HashIndexedView::Entry* old = currentHead;
+    HashIndexedView::Entry* currentHead = globalHt[pos]; // global load (scoreboard stalls) inefficient memory access patterns 
+    HashIndexedView::Entry* old = currentHead; 
+    const uint64_t hash = newNode->hashValue; // global load (scoreboard stalls) inefficient memory access patterns 
     do {
         currentHead = old;
-        newNode->next = currentHead; 
-        newNode = tag(newNode, currentHead, newNode->hashValue);
+        newNode->next = currentHead; // global store (L2 throttle) inefficient memory access patterns 
+        newNode = tag(newNode, currentHead, hash);
         old = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[pos], (unsigned long long)currentHead, (unsigned long long)newNode);
-    } while (old != currentHead);
+    } while (old != currentHead); // takes many instructions (but few stalls)
+}
+
+__device__ __forceinline__ void append(HIVEntry* entry, HashIndexedView::Entry* newNode) {
+    entry->writeOutPos = newNode->hashValue;
+    newNode->next = entry->head; 
+    newNode = tag(newNode, entry->head, newNode->hashValue);
+    if(!entry){
+        entry->tail = newNode;
+    }
 }
 
 
@@ -427,6 +440,104 @@ __global__ void buildHashIndexedViewAdvancedSMEMWarpLevel(GrowingBuffer* buffer,
 }
 
 template<HashIndexedViewBuilderType Qimpl = HashIndexedViewBuilderType::BufferToSM>
+__global__ void buildHashIndexedViewAdvancedSMEM2LVL(GrowingBuffer* buffer, HashIndexedView* view) {
+    const int warpCount = (blockDim.x + (warp_size-1)) / warp_size;
+    const int warpId = threadIdx.x / warp_size;
+    const int warpLane = threadIdx.x % warp_size;
+    const int numThreadsTotal = blockDim.x * gridDim.x;
+    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
+    
+    /* The idea is outlined, but the code is a bit buggy (we miss some values in the final view->ht). 
+       Even so, it is very slow, likely due to threadLocalScratch being partially in global mem.
+    */
+    const int powerTwoTemp{10};
+    const int threadLocal{6};
+    const size_t scracthPadMaskTL{(1 << threadLocal) - 1};
+    const size_t scracthPadMask{(1 << powerTwoTemp) - 1};
+    __shared__ HIVEntry scracthPad[1 << powerTwoTemp];
+    HIVEntry threadLocalScratch[1 << threadLocal];
+
+    for(int i = threadIdx.x; i < scracthPadMask+1; i+=blockDim.x){
+        scracthPad[i].writeOutPos = -1ll;
+        scracthPad[i].head = nullptr;
+        scracthPad[i].tail = nullptr;
+    }
+    __syncthreads();
+
+    for(int i = 0; i < scracthPadMaskTL+1; ++i ){
+        threadLocalScratch[i].writeOutPos = -1ll;
+        threadLocalScratch[i].head = nullptr;
+        threadLocalScratch[i].tail = nullptr;
+    }
+
+    auto& values = buffer->getValues();
+    int bufferIdxStart{0};
+    int bufferIdxStep{0};
+    int bufferEntryIdxStart{0};
+    int bufferEntryIdxStep{0};
+    if constexpr(Qimpl == HashIndexedViewBuilderType::BufferToSM){
+        bufferIdxStart = blockIdx.x;
+        bufferIdxStep = gridDim.x;
+        bufferEntryIdxStart = threadIdx.x;
+        bufferEntryIdxStep = blockDim.x;
+    }
+    else{
+        bufferIdxStart = 0;
+        bufferIdxStep = 1;
+        bufferEntryIdxStart = globalTid;
+        bufferEntryIdxStep = numThreadsTotal;
+    }
+    int conflictCnt{0};
+    for(int bufIdx=bufferIdxStart; bufIdx<values.buffers.count; bufIdx+=bufferIdxStep){ // Buffer-per-block
+        auto* buffer = &values.buffers.payLoad[bufIdx];
+        for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < buffer->numElements; bufEntryIdx+=bufferEntryIdxStep) { // Entry-per-warp
+            HashIndexedView::Entry* entry = (HashIndexedView::Entry*) &buffer->ptr[bufEntryIdx * typeSize];
+            size_t hash = (size_t) entry->hashValue;
+            const size_t posGlobal = hash & view->htMask;
+            const size_t posTLocal = hash & scracthPadMaskTL;
+
+            if(threadLocalScratch[posTLocal].writeOutPos == -1 || (threadLocalScratch[posTLocal].writeOutPos & scracthPadMaskTL) == posGlobal){
+                append(&threadLocalScratch[posTLocal], entry);
+            } else { // No slot in thread-local, try SMEM
+                const size_t posLocal = hash & scracthPadMask;
+                const int64_t writeOutPos = atomicCAS((unsigned long long*)&scracthPad[posLocal].writeOutPos, (unsigned long long)-1, (unsigned long long)hash);
+                // printf("[Considering] writeOutPos=%lld, posGlobal=%lu, posLocal=%lu, hash=%d\n", writeOutPos, posGlobal, posLocal, entry->hashValue);
+
+                if(writeOutPos == -1 || writeOutPos & scracthPadMask == posGlobal){ // Was an empty SMEM slot, we just occupied it with posGlobal. OR matched the writeout position.
+                    atomicAppendSMEM(scracthPad, posLocal, entry);
+                    // printf("[CACHED APPEND] writeOutPos=%lld, posLocal=%lu, hash=%d\n", writeOutPos, posLocal, entry->hashValue);
+
+                } else { // If we have a collision (scratch pad's entry writeout position != entry's writeOut pos) -> write directly to global.
+                    atomicAppend(view->ht, posGlobal, entry);
+                    conflictCnt++;
+                }
+            }
+
+        }
+    }
+    for(int i = 0; i < scracthPadMaskTL+1; i++){
+        if(threadLocalScratch[i].head){
+            const int64_t entryHash = threadLocalScratch[i].writeOutPos;
+            const int64_t posSMEM = entryHash & scracthPadMask;
+            const int64_t posGlobal = entryHash & view->htMask;
+            const int64_t entryHashSMEM = atomicCAS((unsigned long long*)&scracthPad[posSMEM].writeOutPos, (unsigned long long)-1, (unsigned long long)entryHash);
+            if(entryHashSMEM == -1 || ((entryHashSMEM & view->htMask) == posGlobal)){ 
+                atomicAppendSubList(reinterpret_cast<HashIndexedView::Entry**>(&scracthPad[posSMEM]), 0, threadLocalScratch[i].head, threadLocalScratch[i].tail);
+            } else {
+                atomicAppendSubList(view->ht, posGlobal, threadLocalScratch[i].head, threadLocalScratch[i].tail);
+            }
+        }
+    }
+
+    __syncthreads();
+    for(int i = threadIdx.x; i < scracthPadMask+1; i+=blockDim.x){
+        if(scracthPad[i].head){
+            atomicAppendSubList(view->ht, scracthPad[i].writeOutPos & view->htMask, scracthPad[i].head, scracthPad[i].tail);
+        }
+    }
+}
+
+template<HashIndexedViewBuilderType Qimpl = HashIndexedViewBuilderType::BufferToSM>
 __global__ void buildHashIndexedViewAdvancedSMEM(GrowingBuffer* buffer, HashIndexedView* view) {
     const int warpCount = (blockDim.x + (warp_size-1)) / warp_size;
     const int warpId = threadIdx.x / warp_size;
@@ -462,28 +573,25 @@ __global__ void buildHashIndexedViewAdvancedSMEM(GrowingBuffer* buffer, HashInde
         bufferEntryIdxStart = globalTid;
         bufferEntryIdxStep = numThreadsTotal;
     }
-    int conflictCnt{0};
-    for(int bufIdx=bufferIdxStart; bufIdx<values.buffers.count; bufIdx+=bufferIdxStep){ // Buffer-per-block
+    // int conflictCnt{0};
+    const int buffersCnt{values.buffers.count}; // Global load 
+    const size_t globalMask{view->htMask}; // Global load 
+    HashIndexedView::Entry** globalHt{view->ht}; // Global load 
+
+    for(int bufIdx=bufferIdxStart; bufIdx<buffersCnt; bufIdx+=bufferIdxStep){  
         auto* buffer = &values.buffers.payLoad[bufIdx];
-        for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < buffer->numElements; bufEntryIdx+=bufferEntryIdxStep) { // Entry-per-warp
+        const int entryCnt{buffer->numElements}; // Global load 
+        for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < entryCnt; bufEntryIdx+=bufferEntryIdxStep) { 
             HashIndexedView::Entry* entry = (HashIndexedView::Entry*) &buffer->ptr[bufEntryIdx * typeSize];
-            size_t hash = (size_t) entry->hashValue;
-            const size_t posGlobal = hash & view->htMask;
+            size_t hash = (size_t) entry->hashValue; // Global load (heavy)
+            const size_t posGlobal = hash & globalMask;
             const size_t posLocal = hash & scracthPadMask;
-
-            HashIndexedView::Entry* localEntryCurrent = scracthPad[posLocal].head;
-            HashIndexedView::Entry* old = localEntryCurrent;
-
             const int64_t writeOutPos = atomicCAS((unsigned long long*)&scracthPad[posLocal].writeOutPos, (unsigned long long)-1, (unsigned long long)posGlobal);
-            // printf("[Considering] writeOutPos=%lld, posGlobal=%lu, posLocal=%lu, hash=%d\n", writeOutPos, posGlobal, posLocal, entry->hashValue);
-
             if(writeOutPos == -1 || writeOutPos == posGlobal){ // Was an empty SMEM slot, we just occupied it with posGlobal. OR matched the writeout position.
                 atomicAppendSMEM(scracthPad, posLocal, entry);
-                // printf("[CACHED APPEND] writeOutPos=%lld, posLocal=%lu, hash=%d\n", writeOutPos, posLocal, entry->hashValue);
-
             } else { // If we have a collision (scratch pad's entry writeout position != entry's writeOut pos) -> write directly to global.
-                atomicAppend(view->ht, posGlobal, entry);
-                conflictCnt++;
+                atomicAppend(globalHt, posGlobal, entry);
+                // conflictCnt++;
             }
         }
     }
@@ -498,7 +606,6 @@ __global__ void buildHashIndexedViewAdvancedSMEM(GrowingBuffer* buffer, HashInde
             // printf("[FINAL] SUBCHAIN LENGTH %d\n", scracthPad[i].chainLength);
         }
     }
-    
 }
 
 template<HashIndexedViewBuilderType Qimpl = HashIndexedViewBuilderType::BufferToSM>
@@ -788,6 +895,9 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(int** probeCols,
     constexpr size_t outputMask = PreAggregationHashtableFragment::numOutputs - 1;
     constexpr size_t htShift = 6; 
 
+// __device__ inline void prefetch_l2(const void *p) {
+//   asm("prefetch.global.L2 [%0];" : : "l"(p));
+// }
 
     const int powerTwoTemp{10};
     const int scracthPadSize{1 << powerTwoTemp};
@@ -826,13 +936,12 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(int** probeCols,
         if(!remainInLoop){break;}
         ////// PROBE JOIN CONDITION //////
         const int key = probeCols[0][probeColIdx];
-        const int val = probeCols[numProbeCols-1][probeColIdx];
         const uint32_t hash = hashInt32(key);
         const uint32_t pos = hash & view->htMask;
-        HashIndexedViewEntry* current = reinterpret_cast<HashIndexedViewEntry*>(view->ht[pos]); // we have one view here (can have more in case of joins)
+        HashIndexedViewEntry* current = reinterpret_cast<HashIndexedViewEntry*>(view->ht[pos]); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
         bool foundMatch{false};
         while(current){ 
-            foundMatch = (current->hashValue == hash && current->key == key);
+            foundMatch = (current->hashValue == hash && current->key == key); // Global load (uncoalesced, very heavy)
             if (foundMatch) {break;}
             current = current->next;
         }
@@ -840,7 +949,7 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(int** probeCols,
         ////// INSERT/UPDATE PARTIAL AGGREGATE //////
         const int maskFoundMatch = __ballot_sync(maskLoop, foundMatch);
         if(foundMatch){
-            const int groupVal = current->value;
+            const int groupVal = current->value; // Global load (uncoalesced = bad L2)
             const uint32_t hashGroupCol = hashInt32(groupVal);
             const int scracthPadPos = (hashGroupCol >> htShift) & scracthPadMask;
             HashIndexedViewEntry* partialAggEntry = reinterpret_cast<HashIndexedViewEntry*>(scracthPad[scracthPadPos]);
@@ -848,27 +957,29 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(int** probeCols,
             if(!partialAggEntry){ 
                 needInsert = true; // if no entry found (nullptr) at position
             } else {
-                if(partialAggEntry->hashValue == hashGroupCol){ 
+                if(partialAggEntry->hashValue == hashGroupCol){ // Global load (stalls)
                     if(partialAggEntry->key == groupVal){
-                        atomicAdd(&buildStats.hits, 1);
+                        // atomicAdd(&buildStats.hits, 1);
                         needInsert = false; // if found entry, hash and key match
                     } else { 
-                        atomicAdd(&buildStats.keyMismatch, 1);
+                        // atomicAdd(&buildStats.keyMismatch, 1);
                         needInsert = true; // if key doesn't match, collision -> insert
                     }
                 } else { 
-                    atomicAdd(&buildStats.hashMismatch,1);
+                    // atomicAdd(&buildStats.hashMismatch,1);
                     needInsert = true; // if hash doesn't match
                 }
             }
+            const int val = probeCols[numProbeCols-1][probeColIdx];
             const int maskNeedInsert = __ballot_sync(maskFoundMatch, needInsert);
             if(needInsert){ // myFrag is warp-local, so multiple threads of the same warp can call insert()
 
                 // printf("[%d]SETTING KEY %d of %p\n",threadIdx.x, groupVal,partialAggEntry);
                 partialAggEntry = reinterpret_cast<HashIndexedViewEntry*>(myFrag->insert(hashGroupCol, maskNeedInsert));
-                partialAggEntry->key = groupVal; // write key
-                partialAggEntry->value = 0; // initialize value (aggregate)
-                if(atomicExch((unsigned long long*)&myFrag->ht[scracthPadPos], (unsigned long long)partialAggEntry) == 0){atomicAdd(&buildStats.evicted, 1);} // only write ptr to an initialized entry 
+                partialAggEntry->key = groupVal; // write key Global store (uncoalesced)
+                partialAggEntry->value = 0; // initialize value (aggregate) Global store (uncoalesced)
+                atomicExch((unsigned long long*)&myFrag->ht[scracthPadPos], (unsigned long long)partialAggEntry);
+                // if(atomicExch((unsigned long long*)&myFrag->ht[scracthPadPos], (unsigned long long)partialAggEntry) == 0){atomicAdd(&buildStats.evicted, 1);} // only write ptr to an initialized entry 
             }
             atomicAdd(&partialAggEntry->value, val);
             // if(groupVal != outputEntry->value){
@@ -1015,29 +1126,31 @@ __global__ void mergePreAggregationHashtableFragmentsSingleThread(PreAggregation
 
     PreAggregationHashtable::Entry** ht = preAggrHT->ht[partitionId].ht;
     const size_t htMask = preAggrHT->ht[partitionId].hashMask;
-    __syncthreads();
-    for(int fragmentId = 0; fragmentId < static_cast<int>(numFrags); fragmentId++){ 
+    // __syncthreads();
+    for(int fragmentId = 0; fragmentId < numFrags; fragmentId++){ 
         FlexibleBuffer* fragmentPartitionBuffer = globalOutputsVec[fragmentId * 64 + partitionId];
-        if(!fragmentPartitionBuffer){continue;}
-        for(int bufferIdx = partitionWorkerId; bufferIdx < fragmentPartitionBuffer->buffers.count; bufferIdx+=stride){
+        if(!fragmentPartitionBuffer){continue;} // many stalls, long scoreboard
+        const int buffersCnt{fragmentPartitionBuffer->buffers.count};
+        for(int bufferIdx = partitionWorkerId; bufferIdx < buffersCnt; bufferIdx+=stride){
             Buffer* buf = &fragmentPartitionBuffer->buffers.payLoad[bufferIdx];
+            const int elemsCnt{buf->numElements};
             for (int elementIdx = threadIdx.x; elementIdx < buf->numElements; elementIdx+=blockDim.x) {
-                PreAggregationHashtableFragment::Entry* curr = reinterpret_cast<PreAggregationHashtableFragment::Entry*>(&buf->ptr[elementIdx * typeSize]);
-                const size_t pos = curr->hashValue >> PreAggregationHashtableFragment::htShift & htMask;
+                PreAggregationHashtableFragment::Entry* curr = reinterpret_cast<PreAggregationHashtableFragment::Entry*>(&buf->ptr[elementIdx * typeSize]); // Global load
+                const size_t pos = curr->hashValue >> PreAggregationHashtableFragment::htShift & htMask; // Global load
                 
                 // auto* p = reinterpret_cast<HashIndexedViewEntry*>(curr);
                 // printf("[Partition %d][POS %lu] MERGING hash=%llu, key=%d\n", partitionId, pos, p->hashValue, p->key);
                 // PreAggregationHashtable::Entry* currCandidate = untag(ht[pos]);
                 PreAggregationHashtable::Entry* currCandidate;
                 do{
-                    currCandidate = reinterpret_cast<PreAggregationHashtable::Entry*>(atomicExch((unsigned long long*)&ht[pos], 1ull));
+                    currCandidate = reinterpret_cast<PreAggregationHashtable::Entry*>(atomicExch((unsigned long long*)&ht[pos], 1ull)); // global write, long scoreboards
                 }
                 while((unsigned long long)currCandidate == 1ull);
 
                 bool merged = false;
                 while (currCandidate) {
-                    if (currCandidate->hashValue == curr->hashValue && eqInt(currCandidate->content, curr->content)) {
-                        combineInt(currCandidate->content, curr->content);
+                    if (currCandidate->hashValue == curr->hashValue && eqInt(currCandidate->content, curr->content)) { // Global loads, stalls, bad L2
+                        combineInt(currCandidate->content, curr->content); // bad L2
                         merged = true;
                         break;
                     }
@@ -1237,9 +1350,9 @@ int main(int argc, char* argv[]) {
             std::cout << "[buildHashIndexedView] Launch config: <<<" <<hashBuilderNumBlocks << ","<<hashBuilderNumThreadsPerTB <<  ">>>\n";
             // buildHashIndexedViewAdvancedSMEMWarpLevel<HashIndexedViewBuilderType::BufferToSM><<<hashBuilderNumBlocks,256>>>(result, result_view);
             // CHECK_CUDA_ERROR(cudaMemset(h_result_view->ht, 0, htAllocSize)); // zero ht buffer
-            buildHashIndexedViewAdvancedSMEM<HashIndexedViewBuilderType::BufferToSM><<<hashBuilderNumBlocks,256>>>(result, result_view);
-            CHECK_CUDA_ERROR(cudaMemset(h_result_view->ht, 0, htAllocSize)); // zero ht buffer
-            buildHashIndexedView<HashIndexedViewBuilderType::BufferToSM><<<numBlocks,numThreadsInBlock>>>(result, result_view);
+            buildHashIndexedViewAdvancedSMEM<HashIndexedViewBuilderType::BufferToGPU><<<hashBuilderNumBlocks,512>>>(result, result_view);
+            // CHECK_CUDA_ERROR(cudaMemset(h_result_view->ht, 0, htAllocSize)); // zero ht buffer
+            // buildHashIndexedViewAdvancedSMEM2LVL<HashIndexedViewBuilderType::BufferToGPU><<<1,32>>>(result, result_view);
             // printHashIndexedView<<<1,1>>>(result_view);
             cudaDeviceSynchronize();
             t = cudaGetLastError();
