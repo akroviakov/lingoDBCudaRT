@@ -5,6 +5,7 @@
 #include "LazyJoinHashtable.cuh"
 #include "PreAggregationHashtable.cuh"
 #include "PrefixSum.cuh"
+#include "helper.cuh"
 #include <cuda_runtime.h>
 
 constexpr uint64_t KiB = 1024;
@@ -14,6 +15,8 @@ constexpr uint64_t HEAP_SIZE{3*GiB};
 constexpr uint64_t NUM_RUNS = 3;
 
 int sf=1;
+
+// ./Bench /somepath/crystal/test/ssb/data/ 1 1
 
 constexpr int INIT_CAPACITY = INITIAL_CAPACITY;
 constexpr int WARP_SIZE = 32;
@@ -318,22 +321,21 @@ ViewResult buildView(int* filterCol, int* keyCol, int* valCol, int numTuples){
     CHECK_CUDA_ERROR(cudaMallocHost(&res.h_hash_view, sizeof(HashIndexedView)));
     CHECK_CUDA_ERROR(cudaMalloc(&res.d_hash_view, sizeof(HashIndexedView)));
     
-    std::cout << "Col numTuples=" <<  numTuples << "\n";
     growingBufferInit<<<1,1>>>(res.d_filter_scan);
-    growingBufferFillTB<Table><<<1,1>>>(filterCol, keyCol, valCol, numTuples, res.d_filter_scan);
+    growingBufferFillTB<Table><<<30,320>>>(filterCol, keyCol, valCol, numTuples, res.d_filter_scan);
     cudaDeviceSynchronize();
     CHECK_CUDA_ERROR(cudaGetLastError());
 
 
     CHECK_CUDA_ERROR(cudaMemcpy(res.h_filter_scan, res.d_filter_scan, sizeof(GrowingBuffer), cudaMemcpyDeviceToHost));
     auto [htAllocSize, htMask] = getHtSizeMask(res.h_filter_scan->getValues().getLen(), sizeof(GrowingBufEntryScan*)); // if needed, specialize GrowingBufEntryScan*
-    std::cout << "Has " << res.h_filter_scan->getValues().getLen() << " elements\n";
+    std::cout << "Filter in: " << numTuples << ", filter out: " <<  res.h_filter_scan->getValues().getLen() << "\n";
     res.h_hash_view->htMask = htMask;
     CHECK_CUDA_ERROR(cudaMalloc(&res.h_hash_view->ht, htAllocSize));
     CHECK_CUDA_ERROR(cudaMemset(res.h_hash_view->ht, 0, htAllocSize));
     CHECK_CUDA_ERROR(cudaMemcpy(res.d_hash_view, res.h_hash_view, sizeof(HashIndexedView), cudaMemcpyHostToDevice));
     
-    buildHashIndexedViewAdvancedSMEM<HashIndexedViewBuilderType::BufferToGPU><<<1,1>>>(res.d_filter_scan, res.d_hash_view);
+    buildHashIndexedViewAdvancedSMEM<HashIndexedViewBuilderType::BufferToGPU><<<30,256>>>(res.d_filter_scan, res.d_hash_view);
     cudaDeviceSynchronize();
     CHECK_CUDA_ERROR(cudaGetLastError());
 
@@ -356,11 +358,11 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
     constexpr size_t outputMask = PreAggregationHashtableFragment::numOutputs - 1;
     constexpr size_t htShift = 6; 
 
-// __device__ inline void prefetch_l2(const void *p) {
-//   asm("prefetch.global.L2 [%0];" : : "l"(p));
-// }
 
-    const int powerTwoTemp{10};
+    // SMEM size is very important for reducing work in the merge phase. 
+    // Example RTX 2060, Q4.1. SF10: 2^10 leads to 10ms in merge, 2^12 leads to 170us(!) in merge.
+    // However, the fragment building phase remains bottlenecked by the bandwidth (scan of a large relation with probes).
+    const int powerTwoTemp{12}; 
     const int scracthPadSize{1 << powerTwoTemp};
     const size_t scracthPadMask{scracthPadSize - 1};
 
@@ -401,28 +403,28 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         const int lo_key_S = lo_suppkey[probeColTupleIdx];
         const uint32_t hash_S = hashInt32(lo_key_S);
         const size_t pos_S = hash_S & sView->htMask;
-        GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(sView->ht[pos_S]); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
+        GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(sView->ht[pos_S], hash_S)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
         while(current_S){ 
             if (current_S->hashValue == hash_S && current_S->key == lo_key_S) {
                 ////// PROBE C JOIN CONDITION //////
                 const int lo_key_C = lo_custkey[probeColTupleIdx];
                 const uint32_t hash_C = hashInt32(lo_key_C);
                 const size_t pos_C = hash_C & cView->htMask;
-                current_C = reinterpret_cast<GrowingBufEntryScan*>(cView->ht[pos_C]); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
+                current_C = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cView->ht[pos_C], hash_C)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
                 while(current_C){ 
                     if (current_C->hashValue == hash_C && current_C->key == lo_key_C) {
                         ////// PROBE P JOIN CONDITION //////
                         const int lo_key_P = lo_partkey[probeColTupleIdx];
                         const uint32_t hash_P = hashInt32(lo_key_P);
                         const size_t pos_P = hash_P & pView->htMask;
-                        GrowingBufEntryScan* current_P = reinterpret_cast<GrowingBufEntryScan*>(pView->ht[pos_P]);
+                        GrowingBufEntryScan* current_P = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(pView->ht[pos_P], hash_P));
                         while(current_P){
                             if (current_P->hashValue == hash_P && current_P->key == lo_key_P) {
                                 ////// PROBE D JOIN CONDITION //////
                                 const int lo_key_D = lo_orderdate[probeColTupleIdx];
                                 const uint32_t hash_D = hashInt32(lo_key_D);
                                 const size_t pos_D = hash_D & dView->htMask;
-                                current_D = reinterpret_cast<GrowingBufEntryScan*>(dView->ht[pos_D]);
+                                current_D = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(dView->ht[pos_D], hash_D));
                                 while(current_D){
                                     if(current_D->hashValue == hash_D && current_D->key == lo_key_D){
                                         foundMatch = true;
@@ -465,16 +467,18 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
                     needInsert = true; // if hash doesn't match
                 }
             }
+            const int64_t value = lo_revenue[probeColTupleIdx] - lo_supplycost[probeColTupleIdx];
             const int maskNeedInsert = __ballot_sync(maskFoundMatch, needInsert);
             if(needInsert){ // myFrag is warp-local, so multiple threads of the same warp can call insert()
                 partialAggEntry = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->insert(hashGroupCols, maskNeedInsert));
                 partialAggEntry->key[0] = current_D->value; // write key Global store (uncoalesced)
                 partialAggEntry->key[1] = current_C->value;
-                partialAggEntry->value = 0; // initialize value (aggregate) Global store (uncoalesced)
+                partialAggEntry->value = value; // initialize value (aggregate) Global store (uncoalesced)
                 atomicExch((unsigned long long*)&myFrag->ht[scracthPadPos], (unsigned long long)partialAggEntry);
                 // if(atomicExch((unsigned long long*)&myFrag->ht[scracthPadPos], (unsigned long long)partialAggEntry) == 0){atomicAdd(&buildStats.evicted, 1);} // only write ptr to an initialized entry 
+            } else {
+                atomicAdd(reinterpret_cast<unsigned long long*>(&partialAggEntry->value), (long long)(value));
             }
-            atomicAdd(reinterpret_cast<unsigned long long*>(&partialAggEntry->value), (long long)(lo_revenue[probeColTupleIdx] - lo_supplycost[probeColTupleIdx]));
         }
         ////// [END] INSERT/UPDATE PARTIAL AGGREGATE //////
     }
@@ -482,14 +486,14 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
 
     if(!warpLane){
         int su = 0;
-        for(int i = 0; i < 64; i++){
+        for(int i = 0; i < PreAggregationHashtableFragment::numOutputs; i++){
             if(myFrag->outputs[i]){
                 atomicAdd((unsigned long long*)&htSizes[i], (unsigned long long)myFrag->outputs[i]->getLen());
                 su += myFrag->outputs[i]->getLen();
             }
             // printf("[buildPreAggr] outputs[%d] = %p\n", i, myFrag->outputs[i]);
         }
-        memcpy(&globalOutputs[globalWarpID*64], myFrag->outputs, sizeof(FlexibleBuffer *) * 64);
+        memcpy(&globalOutputs[globalWarpID*PreAggregationHashtableFragment::numOutputs], myFrag->outputs, sizeof(FlexibleBuffer *) * PreAggregationHashtableFragment::numOutputs);
         freePtr(myFrag);
     }
     ///////////////////////////////////////////
@@ -541,7 +545,7 @@ __global__ void INITPreAggregationHashtableFragmentsSingleThread(PreAggregationH
         new(preAggrHT) PreAggregationHashtable(preAllocatedPartitions);
     }
 }
-__global__ void mergePreAggregationHashtableFragmentsSingleThread(
+__global__ void mergePreAggregationHashtableFragments(
         PreAggregationHashtable* preAggrHT, 
         PreAggregationHashtable::PartitionHt* preAllocatedPartitions, 
         FlexibleBuffer** globalOutputsVec, 
@@ -650,12 +654,14 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         CHECK_CUDA_ERROR(cudaMallocHost(&h_outputsSizes, sizeof(size_t) * 64));
         CHECK_CUDA_ERROR(cudaMalloc(&d_outputsSizes, sizeof(size_t) * 64));
         cudaMemset(d_outputsSizes, 0, sizeof(size_t) * 64); // sizes are accumulated, so first init to 0 
-
-        const size_t numFragments = 1; // max(1ul,(numBlocks*numThreadsInBlockPreAggr)/32);
+        
+        const size_t numBlocks = 30;
+        const size_t numThreadsInBlockPreAggr = 256;
+        const size_t numFragments = max(1ul,(numBlocks*numThreadsInBlockPreAggr)/WARP_SIZE);
         const size_t outputsPointersArraySize = sizeof(FlexibleBuffer*) * (64 * numFragments); // each fragment has 64 partitions
         CHECK_CUDA_ERROR(cudaMalloc(&allOutputs_d, outputsPointersArraySize)); 
         // std::cout << "[buildPreAggregationHashtableFragments] Launch config: <<<" <<numBlocks << ","<<numThreadsInBlockPreAggr <<  ">>>\n";
-        buildPreAggregationHashtableFragmentsAdvanced<<<numFragments,1>>>(
+        buildPreAggregationHashtableFragmentsAdvanced<<<numBlocks,numThreadsInBlockPreAggr>>>(
             lo_orderdate, lo_partkey, lo_custkey, lo_suppkey, lo_revenue, lo_supplycost, lo_len,
             sView.d_hash_view, cView.d_hash_view, pView.d_hash_view, dView.d_hash_view, 
             allOutputs_d, d_outputsSizes
@@ -689,7 +695,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         CHECK_CUDA_ERROR(cudaMalloc(&d_result_preAggrHT, sizeof(PreAggregationHashtable)));
 
         INITPreAggregationHashtableFragmentsSingleThread<<<1,1>>>(d_result_preAggrHT, d_preAllocatedPartitions);
-        mergePreAggregationHashtableFragmentsSingleThread<<<64,1>>>(d_result_preAggrHT, d_preAllocatedPartitions, allOutputs_d, numFragments);
+        mergePreAggregationHashtableFragments<<<64,512>>>(d_result_preAggrHT, d_preAllocatedPartitions, allOutputs_d, numFragments);
         printPreAggregationHashtable<<<1,1>>>(d_result_preAggrHT, false);
         cudaDeviceSynchronize();
         CHECK_CUDA_ERROR(cudaGetLastError());
