@@ -324,7 +324,7 @@ ViewResult buildView(int* filterCol, int* keyCol, int* valCol, int numTuples){
     growingBufferInit<<<1,1>>>(res.d_filter_scan);
     // If you execute __syncthreads() to synchronize the threads of a block, it is recommended to have more than the achieved 1 blocks per multiprocessor. 
     // This way, blocks that aren't waiting for __syncthreads() can keep the hardware busy
-    growingBufferFillTB<Table><<<60,320>>>(filterCol, keyCol, valCol, numTuples, res.d_filter_scan); 
+    growingBufferFillTB<Table><<<60,1024>>>(filterCol, keyCol, valCol, numTuples, res.d_filter_scan); 
     cudaDeviceSynchronize();
     CHECK_CUDA_ERROR(cudaGetLastError());
 
@@ -363,7 +363,7 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
 
     // SMEM size is very important for reducing work in the merge phase. 
     // Example RTX 2060, Q4.1. SF10: 2^10 leads to 10ms in merge, 2^12 leads to 170us-1ms(!) in merge.
-    // However, the fragment building phase remains bottlenecked by the bandwidth (scan of a large relation with probes).
+    // However, the fragment building phase remains bottlenecked by the read latency (scan of a large relation with probes).
     const int powerTwoTemp{12}; 
     const int scracthPadSize{1 << powerTwoTemp};
     const size_t scracthPadMask{scracthPadSize - 1};
@@ -664,7 +664,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         cudaMemset(d_outputsSizes, 0, sizeof(size_t) * 64); // sizes are accumulated, so first init to 0 
         
         const size_t numBlocks = 30;
-        const size_t numThreadsInBlockPreAggr = 256;
+        const size_t numThreadsInBlockPreAggr = 1024;
         const size_t numFragments = max(1ul,(numBlocks*numThreadsInBlockPreAggr)/WARP_SIZE);
         const size_t outputsPointersArraySize = sizeof(FlexibleBuffer*) * (64 * numFragments); // each fragment has 64 partitions
         CHECK_CUDA_ERROR(cudaMalloc(&allOutputs_d, outputsPointersArraySize)); 
