@@ -322,7 +322,9 @@ ViewResult buildView(int* filterCol, int* keyCol, int* valCol, int numTuples){
     CHECK_CUDA_ERROR(cudaMalloc(&res.d_hash_view, sizeof(HashIndexedView)));
     
     growingBufferInit<<<1,1>>>(res.d_filter_scan);
-    growingBufferFillTB<Table><<<30,320>>>(filterCol, keyCol, valCol, numTuples, res.d_filter_scan);
+    // If you execute __syncthreads() to synchronize the threads of a block, it is recommended to have more than the achieved 1 blocks per multiprocessor. 
+    // This way, blocks that aren't waiting for __syncthreads() can keep the hardware busy
+    growingBufferFillTB<Table><<<60,320>>>(filterCol, keyCol, valCol, numTuples, res.d_filter_scan); 
     cudaDeviceSynchronize();
     CHECK_CUDA_ERROR(cudaGetLastError());
 
@@ -360,21 +362,29 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
 
 
     // SMEM size is very important for reducing work in the merge phase. 
-    // Example RTX 2060, Q4.1. SF10: 2^10 leads to 10ms in merge, 2^12 leads to 170us(!) in merge.
+    // Example RTX 2060, Q4.1. SF10: 2^10 leads to 10ms in merge, 2^12 leads to 170us-1ms(!) in merge.
     // However, the fragment building phase remains bottlenecked by the bandwidth (scan of a large relation with probes).
     const int powerTwoTemp{12}; 
     const int scracthPadSize{1 << powerTwoTemp};
     const size_t scracthPadMask{scracthPadSize - 1};
 
-    __shared__ PreAggregationHashtableFragmentSMEM::Entry* scracthPad[scracthPadSize];
+    // __shared__ PreAggregationHashtableFragmentSMEM::Entry* scracthPad[scracthPadSize];
+    __shared__ char smem[scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 4*sizeof(HashIndexedView)];
+    PreAggregationHashtableFragmentSMEM::Entry** scracthPad = reinterpret_cast<PreAggregationHashtableFragmentSMEM::Entry**>(smem);
+    HashIndexedView* cachedView_S = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*));
+    HashIndexedView* cachedView_P = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + sizeof(HashIndexedView));
+    HashIndexedView* cachedView_D = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 2*sizeof(HashIndexedView));
+    HashIndexedView* cachedView_C = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 3*sizeof(HashIndexedView));
+
     for(int i = threadIdx.x; i < scracthPadSize; i+=blockDim.x){
         scracthPad[i] = nullptr;
     }
-    // if(threadIdx.x == 0){
-        // buildStats = BuildStatsRadixCache{};
-        // buildStats.scanSize = probeColsLength;
-        // buildStats.size=scracthPadSize;
-    // }
+    if(threadIdx.x == 0){
+        *cachedView_S = *sView;
+        *cachedView_P = *pView;
+        *cachedView_D = *dView;
+        *cachedView_C = *cView;
+    }
     __syncthreads();
 
 
@@ -402,29 +412,29 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         ////// PROBE S JOIN CONDITION //////
         const int lo_key_S = lo_suppkey[probeColTupleIdx];
         const uint32_t hash_S = hashInt32(lo_key_S);
-        const size_t pos_S = hash_S & sView->htMask;
-        GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(sView->ht[pos_S], hash_S)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
+        const size_t pos_S = hash_S & cachedView_S->htMask;
+        GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_S->ht[pos_S], hash_S)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
         while(current_S){ 
-            if (current_S->hashValue == hash_S && current_S->key == lo_key_S) {
+            if (current_S->hashValue == hash_S && current_S->key == lo_key_S) { // STALLS!
                 ////// PROBE C JOIN CONDITION //////
                 const int lo_key_C = lo_custkey[probeColTupleIdx];
                 const uint32_t hash_C = hashInt32(lo_key_C);
-                const size_t pos_C = hash_C & cView->htMask;
-                current_C = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cView->ht[pos_C], hash_C)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
+                const size_t pos_C = hash_C & cachedView_C->htMask;
+                current_C = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_C->ht[pos_C], hash_C)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
                 while(current_C){ 
                     if (current_C->hashValue == hash_C && current_C->key == lo_key_C) {
                         ////// PROBE P JOIN CONDITION //////
                         const int lo_key_P = lo_partkey[probeColTupleIdx];
                         const uint32_t hash_P = hashInt32(lo_key_P);
-                        const size_t pos_P = hash_P & pView->htMask;
-                        GrowingBufEntryScan* current_P = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(pView->ht[pos_P], hash_P));
+                        const size_t pos_P = hash_P & cachedView_P->htMask;
+                        GrowingBufEntryScan* current_P = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_P->ht[pos_P], hash_P));
                         while(current_P){
                             if (current_P->hashValue == hash_P && current_P->key == lo_key_P) {
                                 ////// PROBE D JOIN CONDITION //////
                                 const int lo_key_D = lo_orderdate[probeColTupleIdx];
                                 const uint32_t hash_D = hashInt32(lo_key_D);
-                                const size_t pos_D = hash_D & dView->htMask;
-                                current_D = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(dView->ht[pos_D], hash_D));
+                                const size_t pos_D = hash_D & cachedView_D->htMask;
+                                current_D = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_D->ht[pos_D], hash_D));
                                 while(current_D){
                                     if(current_D->hashValue == hash_D && current_D->key == lo_key_D){
                                         foundMatch = true;
@@ -475,7 +485,6 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
                 partialAggEntry->key[1] = current_C->value;
                 partialAggEntry->value = value; // initialize value (aggregate) Global store (uncoalesced)
                 atomicExch((unsigned long long*)&myFrag->ht[scracthPadPos], (unsigned long long)partialAggEntry);
-                // if(atomicExch((unsigned long long*)&myFrag->ht[scracthPadPos], (unsigned long long)partialAggEntry) == 0){atomicAdd(&buildStats.evicted, 1);} // only write ptr to an initialized entry 
             } else {
                 atomicAdd(reinterpret_cast<unsigned long long*>(&partialAggEntry->value), (long long)(value));
             }
@@ -624,9 +633,8 @@ __global__ void mergePreAggregationHashtableFragments(
     // release_lock(&preAggrHT->mutex);
 }
 
-__global__ void freeKernel(GrowingBuffer* finalBuffer, HashIndexedView* view) {
+__global__ void freeKernel(GrowingBuffer* finalBuffer) {
     finalBuffer->~GrowingBuffer();
-    view->~HashIndexedView();
 }
 
 __global__ void freeFragments(PreAggregationHashtableFragment* partitions, int numPartitions) {
@@ -704,10 +712,15 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         std::cout << "** MERGED PREAGGREGATION FRAGMENTS **" << std::endl;
 
         // Free heap allocations:
-        freeKernel<<<1,1>>>(sView.d_filter_scan, sView.d_hash_view);
-        freeKernel<<<1,1>>>(cView.d_filter_scan, cView.d_hash_view);
-        freeKernel<<<1,1>>>(pView.d_filter_scan, pView.d_hash_view);
-        freeKernel<<<1,1>>>(dView.d_filter_scan, dView.d_hash_view);
+        freeKernel<<<1,1>>>(sView.d_filter_scan);
+        freeKernel<<<1,1>>>(cView.d_filter_scan);
+        freeKernel<<<1,1>>>(pView.d_filter_scan);
+        freeKernel<<<1,1>>>(dView.d_filter_scan);
+        CHECK_CUDA_ERROR(cudaFree(sView.h_hash_view->ht));
+        CHECK_CUDA_ERROR(cudaFree(cView.h_hash_view->ht));
+        CHECK_CUDA_ERROR(cudaFree(pView.h_hash_view->ht));
+        CHECK_CUDA_ERROR(cudaFree(dView.h_hash_view->ht));
+
         cudaDeviceSynchronize();
         CHECK_CUDA_ERROR(cudaGetLastError());
 
