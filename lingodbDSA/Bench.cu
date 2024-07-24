@@ -582,7 +582,7 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         new(myFrag) PreAggregationHashtableFragmentSMEM(TYPE_SIZE_RES_HT, scracthPad, scracthPadSize);
     }
     __syncthreads();
-
+    // int iterCnt{0};
     // iterate over probe cols
     int probeColIdxStart = globalTid;
     int probeColIdxStep = numThreadsTotal;
@@ -667,32 +667,39 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
                 }
             }
         }
-        uint32_t myIdx{-1};
         int64_t value{-1};
-
         if(foundMatch){
             value = lo_revenue[probeColTupleIdx] - lo_supplycost[probeColTupleIdx];
-            if(needInsert){
-                myIdx = atomicAdd(&myFrag->counters[outputPos], 1);
-            } else {
+            if(!needInsert){
                 atomicAdd(reinterpret_cast<unsigned long long*>(&partialAggEntry->value), (long long)(value));
             }
         } 
-        __syncthreads(); // We accumulate the partition counters
-        for(int i = threadIdx.x; i < PreAggregationHashtableFragmentSMEM::numOutputs; i+=blockDim.x){
-            // With accumulated counters, we pick per-partition thread that exclusively requests memory
-            myFrag->insertN(i); // thread-block sequence for an output is allocated
+        const int maskInsert = __ballot_sync(0xFFFFFFFF, (foundMatch && needInsert)); // ALL (0xFFFFFFFF) threads must reach it
+        if(foundMatch && needInsert){
+            int maskSameOutput = __match_any_sync(maskInsert, outputPos);
+            int leader = __ffs(maskSameOutput) -1;
+            int myPosInMask = __popc(maskSameOutput & ((1U << warpLane) - 1));
+            GrowingBufEntryResHT* myOffset;
+            if(warpLane == leader){
+                // printf("[TID %d, iter=%d] outputPos = %d, numElems=%d\n", threadIdx.x, iterCnt, outputPos, __popc(maskSameOutput));
+                myOffset = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->insertNLock(outputPos, __popc(maskSameOutput)));
+                // printf("[TID %d, iter=%d] FINISHED outputPos = %d, numElems=%d\n", threadIdx.x, iterCnt, outputPos, __popc(maskSameOutput));
+            } 
+            if(__popc(maskSameOutput)){
+                myOffset = reinterpret_cast<GrowingBufEntryResHT*>(__shfl_sync(maskSameOutput, (unsigned long long)myOffset, leader));
+            }
+            // printf("[TID %d, iter=%d] FINISHED outputPos = %d, writes to %p\n", threadIdx.x, iterCnt, outputPos, &myOffset[myPosInMask]);
+            // If a thread found a match and needs to insert
+                myOffset[myPosInMask].hashValue = hashGroupCols;
+                myOffset[myPosInMask].key[0] = current_D->value; // index into the allocated sequence
+                myOffset[myPosInMask].key[1] = current_C->value;
+                myOffset[myPosInMask].value = value;
+                myOffset[myPosInMask].next=nullptr;
+                atomicExch((unsigned long long*)&scracthPad[scracthPadPos], (unsigned long long)&myOffset[myPosInMask]);
         }
-        __syncthreads(); // All threads must ensure that their partitions are ready.
-        if(foundMatch && needInsert){ // If a thread found a match and needs to insert
-            GrowingBufEntryResHT* myOffset = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->writeOffsets[outputPos]); // get allocated sequence for the output pos
-            myOffset[myIdx].hashValue = hashGroupCols;
-            myOffset[myIdx].key[0] = current_D->value; // index into the allocated sequence
-            myOffset[myIdx].key[1] = current_C->value;
-            myOffset[myIdx].value = value;
-            myOffset[myIdx].next=nullptr;
-            atomicExch((unsigned long long*)&scracthPad[scracthPadPos], (unsigned long long)&myOffset[myIdx]);
-        }
+        // __syncthreads(); // strict (can be relaxed once works)
+        // if(__popc(maskInsert)){__syncwarp(maskInsert);}
+        // iterCnt++;
         ////// [END] INSERT/UPDATE PARTIAL AGGREGATE //////
     }
     __syncthreads();

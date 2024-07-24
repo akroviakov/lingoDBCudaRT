@@ -38,6 +38,31 @@ class PreAggregationHashtableFragmentSMEM {
         memset(counters, 0, sizeof(uint32_t)*numOutputs);
         memset(writeOffsets, 0, sizeof(Entry*)*numOutputs);
     }  
+
+    __device__ Entry* insertNLock(const int outputPos, const int numElems) {
+        // int maskPartition = __match_any_sync(__activemask(), outputPos);
+        // if(!numElems || __popc(maskPartition) > 1) {
+        //     // printf("[#threads=%d][TID=%d] outputPos=%d\n", __popc(maskPartition), threadIdx.x, outputPos);
+        //     return;
+        // }
+        Entry* newEntry{nullptr};
+        FlexibleBuffer* takeBuffer; // take ownership over a partition (i.e., acquire lock)
+        do {
+            takeBuffer = reinterpret_cast<FlexibleBuffer*>(atomicExch((unsigned long long*)&outputs[outputPos], 1ull));
+        }
+        while((unsigned long long)takeBuffer == 1ull);
+
+        if (!takeBuffer) { 
+            takeBuffer = (FlexibleBuffer*)memAlloc(sizeof(FlexibleBuffer));
+            new (takeBuffer) FlexibleBuffer(256, typeSize, true);
+        }
+        newEntry = reinterpret_cast<Entry*>(takeBuffer->prepareWriteFor(numElems));
+        // printf("[#threads=%d][TID=%d] outputPos=%d, returning %p\n", __popc(maskPartition), threadIdx.x, outputPos, newEntry);
+
+        atomicExch((unsigned long long*)&outputs[outputPos], (unsigned long long)takeBuffer); // release lock
+        return newEntry;
+    }
+
     __device__ void insertN(size_t outputPos) {
         if(!counters[outputPos]){return;}
         Entry* newEntry{nullptr};
