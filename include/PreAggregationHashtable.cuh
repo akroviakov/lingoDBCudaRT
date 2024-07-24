@@ -31,7 +31,25 @@ class PreAggregationHashtableFragmentSMEM {
     volatile int x;
 
     FlexibleBuffer* outputs[numOutputs];
-    __device__ PreAggregationHashtableFragmentSMEM(size_t typeSize, Entry** ht_cache, size_t hashtableSize) : hashtableSize(hashtableSize), htMask(hashtableSize-1), ht(ht_cache), typeSize(typeSize), len(0), outputs() {}  
+    uint32_t counters[numOutputs];
+    Entry* writeOffsets[numOutputs];
+
+    __device__ PreAggregationHashtableFragmentSMEM(size_t typeSize, Entry** ht_cache, size_t hashtableSize) : hashtableSize(hashtableSize), htMask(hashtableSize-1), ht(ht_cache), typeSize(typeSize), len(0), outputs() {
+        memset(counters, 0, sizeof(uint32_t)*numOutputs);
+        memset(writeOffsets, 0, sizeof(Entry*)*numOutputs);
+    }  
+    __device__ void insertN(size_t outputPos) {
+        if(!counters[outputPos]){return;}
+        Entry* newEntry{nullptr};
+        if (!outputs[outputPos]) { 
+            outputs[outputPos] = (FlexibleBuffer*)memAlloc(sizeof(FlexibleBuffer));
+            new (outputs[outputPos]) FlexibleBuffer(256, typeSize, true);
+        }
+        // printf("INSERING: outputPos=%lu, counters[outputPos]=%d, &outputs[outputPos]=%p\n", outputPos, counters[outputPos], &outputs[outputPos]);
+        writeOffsets[outputPos] = reinterpret_cast<Entry*>(outputs[outputPos]->prepareWriteFor(counters[outputPos]));
+        counters[outputPos] = 0;
+        // printf("INSERTED: outputPos=%lu, counters[outputPos]=%d, &outputs[outputPos]=%p\n", outputPos, counters[outputPos], &outputs[outputPos]);
+    }
 
     __device__ Entry* insert(size_t hash, const int warpThreadsInsertMask) {
         const int threadIdxInWarp = threadIdx.x % warpSize;
