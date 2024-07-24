@@ -284,7 +284,6 @@ __global__ void printPreAggregationHashtable(PreAggregationHashtable* ht, bool p
         }
     }
     printf("------------------[END] PreAggregationHashtable [%p]----------------------\n", ht);
-
 }
 
 struct HIVEntry{
