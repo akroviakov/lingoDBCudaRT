@@ -17,7 +17,7 @@ class GrowingBuffer {
     __device__ void merge(GrowingBuffer& other);
     __device__ void merge(LeafFlexibleBuffer* other);
 
-    __host__ __device__ FlexibleBuffer& getValues() { return values; }
+    __host__ __device__ FlexibleBuffer* getValuesPtr() { return &values; }
 };
 
 __device__ uint8_t* GrowingBuffer::insert(const uint32_t numElems) {

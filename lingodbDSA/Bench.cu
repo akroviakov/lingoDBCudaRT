@@ -178,7 +178,8 @@ __global__ void growingBufferFillTB(int* filterCol, int* keyCol, int* valueCol, 
             const int maskWriters = __ballot_sync(__activemask(), pred);
             const int leader = __ffs(maskWriters)-1;
             if(lane == leader){
-                myIdx = atomicAdd(counter, __popc(maskWriters)); // Shared load, heavy inst
+                // _block ensures memory ordering only for this thread block (a more relaxed atomic)
+                myIdx = atomicAdd_block(counter, __popc(maskWriters)); // Shared load, heavy inst
             }
             myIdx = __shfl_sync(maskWriters, myIdx, leader) + __popc(maskWriters & ((1U << lane) - 1)); // barrier stalls
             __syncthreads();
@@ -206,10 +207,9 @@ __global__ void growingBufferFillTB(int* filterCol, int* keyCol, int* valueCol, 
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        acquire_lock(&GLOBAL_LOCK);
-        finalBuffer->getValues().merge(myBuf);
-        __threadfence();
-        release_lock(&GLOBAL_LOCK);
+        while (atomicCAS(&finalBuffer->getValuesPtr()->lock, 0, 1) != 0);
+        finalBuffer->getValuesPtr()->merge(myBuf);
+        atomicExch(&finalBuffer->getValuesPtr()->lock, 0);
     }
     // if(!threadIdx.x){finalBuffer->getValues().print(printEntryScan);}  // only for <<<1,X>>> debug
 }
@@ -285,7 +285,7 @@ __global__ void buildHashIndexedViewAdvancedSMEM(GrowingBuffer* buffer, HashInde
     }
     __syncthreads();
 
-    auto& values = buffer->getValues();
+    auto* values = buffer->getValuesPtr();
     int bufferIdxStart{0};
     int bufferIdxStep{0};
     int bufferEntryIdxStart{0};
@@ -303,12 +303,12 @@ __global__ void buildHashIndexedViewAdvancedSMEM(GrowingBuffer* buffer, HashInde
         bufferEntryIdxStep = numThreadsTotal;
     }
     // int conflictCnt{0};
-    const int buffersCnt{values.getBuffers().size()}; // Global load 
+    const int buffersCnt{values->getBuffers().size()}; // Global load 
     const size_t globalMask{view->htMask}; // Global load 
     HashIndexedView::Entry** globalHt{view->ht}; // Global load 
 
     for(int bufIdx=bufferIdxStart; bufIdx<buffersCnt; bufIdx+=bufferIdxStep){  
-        auto* buffer = &values.getBuffers()[bufIdx];
+        auto* buffer = &values->getBuffers()[bufIdx];
         const int entryCnt{buffer->numElements}; // Global load 
         for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < entryCnt; bufEntryIdx+=bufferEntryIdxStep) { 
             HashIndexedView::Entry* entry = (HashIndexedView::Entry*) &buffer->ptr[bufEntryIdx * TYPE_SIZE_SCAN]; // if needed, specialize TYPE_SIZE_SCAN
@@ -367,8 +367,8 @@ ViewResult buildView(int* filterCol, int* keyCol, int* valCol, int numTuples){
 
 
     CHECK_CUDA_ERROR(cudaMemcpy(res.h_filter_scan, res.d_filter_scan, sizeof(GrowingBuffer), cudaMemcpyDeviceToHost));
-    auto [htAllocSize, htMask] = getHtSizeMask(res.h_filter_scan->getValues().getLen(), sizeof(GrowingBufEntryScan*)); // if needed, specialize GrowingBufEntryScan*
-    std::cout << "Filter in: " << numTuples << ", filter out: " <<  res.h_filter_scan->getValues().getLen() << "\n";
+    auto [htAllocSize, htMask] = getHtSizeMask(res.h_filter_scan->getValuesPtr()->getLen(), sizeof(GrowingBufEntryScan*)); // if needed, specialize GrowingBufEntryScan*
+    std::cout << "Filter in: " << numTuples << ", filter out: " <<  res.h_filter_scan->getValuesPtr()->getLen() << "\n";
     res.h_hash_view->htMask = htMask;
     CHECK_CUDA_ERROR(cudaMalloc(&res.h_hash_view->ht, htAllocSize));
     CHECK_CUDA_ERROR(cudaMemset(res.h_hash_view->ht, 0, htAllocSize));
