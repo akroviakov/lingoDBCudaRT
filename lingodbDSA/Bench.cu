@@ -12,7 +12,7 @@ constexpr uint64_t KiB = 1024;
 constexpr uint64_t MiB = 1024 * KiB;
 constexpr uint64_t GiB = 1024 * MiB;
 constexpr uint64_t HEAP_SIZE{3*GiB};
-constexpr uint64_t NUM_RUNS = 5;
+constexpr uint64_t NUM_RUNS = 2;
 
 int sf=1;
 
@@ -135,7 +135,12 @@ __global__ void growingBufferInit(GrowingBuffer* finalBuffer) {
 
 __device__ volatile int GLOBAL_LOCK{0};
 
-template<TABLE Table>
+enum class FillVariant{
+    ThreadBlockLockStep = 1,
+    Opportunistic = 2
+};
+
+template<TABLE Table, FillVariant Impl = FillVariant::ThreadBlockLockStep>
 __global__ void growingBufferFillTB(int* filterCol, int* keyCol, int* valueCol, int numTuples, GrowingBuffer* finalBuffer) {
     const int warp_count = (blockDim.x + (WARP_SIZE-1)) / WARP_SIZE;
     const int numThreadsTotal = blockDim.x * gridDim.x;
@@ -155,7 +160,7 @@ __global__ void growingBufferFillTB(int* filterCol, int* keyCol, int* valueCol, 
     __syncthreads();
     uint32_t myIdx = 0;
 
-    int roundedSize = ((numTuples + 31) / 32) * 32;
+    int roundedSize = ((numTuples + (WARP_SIZE-1)) / WARP_SIZE) * WARP_SIZE;
     for (int i = globalTid; i < roundedSize; i += numThreadsTotal) {
         bool pred = (i < numTuples);
         if(pred){
@@ -169,26 +174,34 @@ __global__ void growingBufferFillTB(int* filterCol, int* keyCol, int* valueCol, 
                 // No filter
             }
         }
-        const int maskWriters = __ballot_sync(0xFFFFFFFF, pred);
-        if(!lane){
-            myIdx = atomicAdd(counter, __popc(maskWriters)); // Shared load, heavy inst
+        if constexpr(Impl == FillVariant::ThreadBlockLockStep){
+            const int maskWriters = __ballot_sync(__activemask(), pred);
+            const int leader = __ffs(maskWriters)-1;
+            if(lane == leader){
+                myIdx = atomicAdd(counter, __popc(maskWriters)); // Shared load, heavy inst
+            }
+            myIdx = __shfl_sync(maskWriters, myIdx, leader) + __popc(maskWriters & ((1U << lane) - 1)); // barrier stalls
+            __syncthreads();
+            if (threadIdx.x == 0) { // Critical section, try to reduce time (e.g., put myBuf in SMEM).
+                *writeCursor = (GrowingBufEntryScan*)myBuf->insert(*counter);
+                *counter = 0;
+            }
+            __syncthreads();
         }
-        myIdx = __shfl_sync(maskWriters, myIdx, 0) + __popc(maskWriters & ((1U << lane) - 1)); // barrier stalls
-        __syncthreads();
-        if (threadIdx.x == 0) { // Critical section, try to reduce time (e.g., increase SMEM usage).
-            *writeCursor = (GrowingBufEntryScan*)myBuf->prepareWriteFor(*counter);
-            *counter = 0;
-        }
-        __syncthreads();
+        GrowingBufEntryScan* writeTo;
         if (pred) { // Uncoalesced stores
-            GrowingBufEntryScan* writeTo= *writeCursor; // Shared load
+            if constexpr(Impl == FillVariant::ThreadBlockLockStep){
+                writeTo = *writeCursor; // Shared load
+            } else {
+                writeTo = (GrowingBufEntryScan*)myBuf->insertWarpLevelOpportunistic(); // Shared load
+            }
             writeTo[myIdx].key /*[0], [1] for many keys*/ = keyCol[i]; // Global 2 loads, 1 store (LG throttle: L2 can't keep up)
             writeTo[myIdx].hashValue = hashInt32ToInt64(keyCol[i]); // Global store
             if constexpr (Table == TABLE::D || Table == TABLE::C){
                 writeTo[myIdx].value /*[0], [1] for many vals*/ = valueCol[i]; // Global 2 loads, 1 store (many stalls)
             }
-            // writeTo[myIdx].nullFlag = false; // Global store (low impact, 1 byte)
-        }
+        } 
+
     }
     __syncthreads();
 
@@ -290,12 +303,12 @@ __global__ void buildHashIndexedViewAdvancedSMEM(GrowingBuffer* buffer, HashInde
         bufferEntryIdxStep = numThreadsTotal;
     }
     // int conflictCnt{0};
-    const int buffersCnt{values.buffers.count}; // Global load 
+    const int buffersCnt{values.getBuffers().size()}; // Global load 
     const size_t globalMask{view->htMask}; // Global load 
     HashIndexedView::Entry** globalHt{view->ht}; // Global load 
 
     for(int bufIdx=bufferIdxStart; bufIdx<buffersCnt; bufIdx+=bufferIdxStep){  
-        auto* buffer = &values.buffers.payLoad[bufIdx];
+        auto* buffer = &values.getBuffers()[bufIdx];
         const int entryCnt{buffer->numElements}; // Global load 
         for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < entryCnt; bufEntryIdx+=bufferEntryIdxStep) { 
             HashIndexedView::Entry* entry = (HashIndexedView::Entry*) &buffer->ptr[bufEntryIdx * TYPE_SIZE_SCAN]; // if needed, specialize TYPE_SIZE_SCAN
@@ -559,6 +572,13 @@ __global__ void buildPreAggregationHashtableFragmentsAdvancedCG(
     // }
 }  
 */
+constexpr int64_t highestPowerOfTwo(int64_t n) { return n == 0 ? 0 : 1LL << (63 - __builtin_clzll(n));}
+constexpr uint8_t powerOfTwo(int64_t n, int power = 0) {return (n == 1) ? power : powerOfTwo(n / 2, power + 1);}
+constexpr int64_t SMEM_SIZE{36 * KiB};
+static constexpr int64_t freeSMEM{SMEM_SIZE - (sizeof(PreAggregationHashtableFragmentSMEM) + 4*sizeof(HashIndexedView))}; 
+static constexpr uint8_t scracthPadShift{powerOfTwo(highestPowerOfTwo(freeSMEM)/sizeof(PreAggregationHashtableFragmentSMEM::Entry*))};
+static constexpr uint64_t scracthPadSize{1 << scracthPadShift};
+static constexpr uint64_t scracthPadMask{scracthPadSize-1};
 __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         int* lo_orderdate, int* lo_partkey, int* lo_custkey, int* lo_suppkey, int* lo_revenue, int* lo_supplycost, int lo_len,
         HashIndexedView* sView, HashIndexedView* cView, HashIndexedView* pView, HashIndexedView* dView, 
@@ -572,18 +592,6 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
     const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
     const int globalWarpID = globalTid / WARP_SIZE;
 
-    constexpr size_t outputMask = PreAggregationHashtableFragment::numOutputs - 1;
-    constexpr size_t htShift = 6; 
-
-
-    // SMEM size is very important for reducing work in the merge phase. 
-    // Example RTX 2060, Q4.1. SF10: 2^10 leads to 10ms in merge, 2^12 leads to 170us-1ms(!) in merge.
-    // However, the fragment building phase remains bottlenecked by the read latency (scan of a large relation with probes).
-    const int powerTwoTemp{12}; 
-    const int scracthPadSize{1 << powerTwoTemp};
-    const size_t scracthPadMask{scracthPadSize - 1};
-
-    // __shared__ PreAggregationHashtableFragmentSMEM::Entry* scracthPad[scracthPadSize];
     __shared__ char smem[
         scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) 
         + 4*sizeof(HashIndexedView) 
@@ -603,10 +611,9 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         *cachedView_P = *pView;
         *cachedView_D = *dView;
         *cachedView_C = *cView;
-        new(myFrag) PreAggregationHashtableFragmentSMEM(TYPE_SIZE_RES_HT, scracthPad, scracthPadSize);
+        new(myFrag) PreAggregationHashtableFragmentSMEM(TYPE_SIZE_RES_HT);
     }
     __syncthreads();
-    // int iterCnt{0};
     // iterate over probe cols
     int probeColIdxStart = globalTid;
     int probeColIdxStep = numThreadsTotal;
@@ -673,12 +680,10 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         bool needInsert{false};
         int64_t hashGroupCols{-1};
         int scracthPadPos{-1};
-        int outputPos{-1};
         GrowingBufEntryResHT* partialAggEntry = nullptr;
         if(foundMatch){
             hashGroupCols = combineHashes(hashInt32ToInt64(current_D->value), hashInt32ToInt64(current_C->value));
-            scracthPadPos = (hashGroupCols >> htShift) & scracthPadMask;
-            outputPos = hashGroupCols & PreAggregationHashtableFragmentSMEM::outputMask;
+            scracthPadPos = (hashGroupCols >> scracthPadShift) & scracthPadMask;
             partialAggEntry = reinterpret_cast<GrowingBufEntryResHT*>(scracthPad[scracthPadPos]);
             if(!partialAggEntry){ 
                 needInsert = true; // if no entry found (nullptr) at position
@@ -695,39 +700,21 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
                 }
             }
         }
-        int64_t value{-1};
+        int mask = __ballot_sync(0xFFFFFFFF, foundMatch && needInsert);
         if(foundMatch){
-            value = lo_revenue[probeColTupleIdx] - lo_supplycost[probeColTupleIdx];
-            if(!needInsert){
+            int64_t value = lo_revenue[probeColTupleIdx] - lo_supplycost[probeColTupleIdx];
+            if(needInsert){
+                GrowingBufEntryResHT* myEntry = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->insertWarpOpportunistic(hashGroupCols, mask));
+                myEntry->hashValue = hashGroupCols;
+                myEntry->key[0] = current_D->value;
+                myEntry->key[1] = current_C->value;
+                myEntry->value = value;
+                myEntry->next=nullptr;
+                atomicExch((unsigned long long*)&scracthPad[scracthPadPos], (unsigned long long)myEntry);
+            } else {
                 atomicAdd(reinterpret_cast<unsigned long long*>(&partialAggEntry->value), (long long)(value));
             }
         } 
-        const int maskInsert = __ballot_sync(0xFFFFFFFF, (foundMatch && needInsert)); // ALL (0xFFFFFFFF) threads must reach it
-        if(foundMatch && needInsert){
-            int maskSameOutput = __match_any_sync(maskInsert, outputPos);
-            int leader = __ffs(maskSameOutput) -1;
-            int myPosInMask = __popc(maskSameOutput & ((1U << warpLane) - 1));
-            GrowingBufEntryResHT* myOffset;
-            if(warpLane == leader){
-                // printf("[TID %d, iter=%d] outputPos = %d, numElems=%d\n", threadIdx.x, iterCnt, outputPos, __popc(maskSameOutput));
-                myOffset = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->insertNLock(outputPos, __popc(maskSameOutput)));
-                // printf("[TID %d, iter=%d] FINISHED outputPos = %d, numElems=%d\n", threadIdx.x, iterCnt, outputPos, __popc(maskSameOutput));
-            } 
-            if(__popc(maskSameOutput)){
-                myOffset = reinterpret_cast<GrowingBufEntryResHT*>(__shfl_sync(maskSameOutput, (unsigned long long)myOffset, leader));
-            }
-            // printf("[TID %d, iter=%d] FINISHED outputPos = %d, writes to %p\n", threadIdx.x, iterCnt, outputPos, &myOffset[myPosInMask]);
-            // If a thread found a match and needs to insert
-                myOffset[myPosInMask].hashValue = hashGroupCols;
-                myOffset[myPosInMask].key[0] = current_D->value; // index into the allocated sequence
-                myOffset[myPosInMask].key[1] = current_C->value;
-                myOffset[myPosInMask].value = value;
-                myOffset[myPosInMask].next=nullptr;
-                atomicExch((unsigned long long*)&scracthPad[scracthPadPos], (unsigned long long)&myOffset[myPosInMask]);
-        }
-        // __syncthreads(); // strict (can be relaxed once works)
-        // if(__popc(maskInsert)){__syncwarp(maskInsert);}
-        // iterCnt++;
         ////// [END] INSERT/UPDATE PARTIAL AGGREGATE //////
     }
     __syncthreads();
@@ -735,13 +722,13 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
     if(!warpLane){
         int su = 0;
         for(int i = 0; i < PreAggregationHashtableFragment::numOutputs; i++){
-            if(myFrag->outputs[i]){
-                atomicAdd((unsigned long long*)&htSizes[i], (unsigned long long)myFrag->outputs[i]->getLen());
-                su += myFrag->outputs[i]->getLen();
+            if(myFrag->getPartition(i)){
+                atomicAdd((unsigned long long*)&htSizes[i], (unsigned long long)myFrag->getPartition(i)->getLen());
+                su += myFrag->getPartition(i)->getLen();
             }
             // printf("[buildPreAggr] outputs[%d] = %p\n", i, myFrag->outputs[i]);
         }
-        memcpy(&globalOutputs[blockIdx.x * PreAggregationHashtableFragment::numOutputs], myFrag->outputs, sizeof(FlexibleBuffer *) * PreAggregationHashtableFragment::numOutputs);
+        memcpy(&globalOutputs[blockIdx.x * PreAggregationHashtableFragment::numOutputs], myFrag->getPartitionsPtr(), sizeof(FlexibleBuffer *) * PreAggregationHashtableFragment::numOutputs);
     }
     ///////////////////////////////////////////
     // if(!threadIdx.x){myFrag->print(printEntryResHT);}  // only for <<<1,X>>> debug
@@ -824,9 +811,9 @@ __global__ void mergePreAggregationHashtableFragments(
         FlexibleBuffer* fragmentPartitionBuffer = globalOutputsVec[fragmentId * 64 + partitionId];
         // printf("[MergePreAggr][fragmentId=%d] fragmentPartitionBuffer=%p\n",fragmentId, fragmentPartitionBuffer);
         if(!fragmentPartitionBuffer){continue;} // many stalls, long scoreboard
-        const int buffersCnt{fragmentPartitionBuffer->buffers.count};
+        const int buffersCnt{fragmentPartitionBuffer->getBuffers().size()};
         for(int bufferIdx = partitionWorkerId; bufferIdx < buffersCnt; bufferIdx+=stride){
-            Buffer* buf = &fragmentPartitionBuffer->buffers.payLoad[bufferIdx];
+            Buffer* buf = &fragmentPartitionBuffer->getBuffers().payLoad[bufferIdx];
             const int elemsCnt{buf->numElements};
             for (int elementIdx = threadIdx.x; elementIdx < buf->numElements; elementIdx+=blockDim.x) {
                 PreAggregationHashtableFragment::Entry* curr = reinterpret_cast<PreAggregationHashtableFragment::Entry*>(&buf->ptr[elementIdx * TYPE_SIZE_RES_HT]); // Global load

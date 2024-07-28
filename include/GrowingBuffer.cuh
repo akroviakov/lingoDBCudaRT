@@ -7,7 +7,7 @@ class GrowingBuffer {
     FlexibleBuffer values;
     public:
     __device__ GrowingBuffer(size_t cap, size_t typeSize, bool allocateInit=true) : values(cap, typeSize, allocateInit) {}
-    __device__ uint8_t* insert();
+    __device__ uint8_t* insert(const uint32_t numElems);
     __host__ __device__ size_t getLen() const;
     __device__ size_t getTypeSize() const;
     //    __device__ Buffer sort(runtime::ExecutionContext*, bool (*compareFn)(uint8_t*, uint8_t*));
@@ -20,8 +20,8 @@ class GrowingBuffer {
     __host__ __device__ FlexibleBuffer& getValues() { return values; }
 };
 
-__device__ uint8_t* GrowingBuffer::insert() {
-   return values.insert();
+__device__ uint8_t* GrowingBuffer::insert(const uint32_t numElems) {
+   return values.insert(numElems);
 }
 __device__ size_t GrowingBuffer::getLen() const {
    return values.getLen();
@@ -32,11 +32,7 @@ __device__ size_t GrowingBuffer::getTypeSize() const {
 }
 
 __device__ void GrowingBuffer::merge(GrowingBuffer* other) {
-   values.merge(other->values);
-}
-
-__device__ void GrowingBuffer::merge(GrowingBuffer& other) {
-   values.merge(other.values);
+   values.merge(&other->values);
 }
 
 __device__ void GrowingBuffer::merge(LeafFlexibleBuffer* other) {
