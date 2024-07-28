@@ -307,34 +307,45 @@ __global__ void buildHashIndexedViewAdvancedSMEM(GrowingBuffer* buffer, HashInde
     const size_t globalMask{view->htMask}; // Global load 
     HashIndexedView::Entry** globalHt{view->ht}; // Global load 
 
-    for(int bufIdx=bufferIdxStart; bufIdx<buffersCnt; bufIdx+=bufferIdxStep){  
-        auto* buffer = &values->getBuffers()[bufIdx];
-        const int entryCnt{buffer->numElements}; // Global load 
-        for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < entryCnt; bufEntryIdx+=bufferEntryIdxStep) { 
-            HashIndexedView::Entry* entry = (HashIndexedView::Entry*) &buffer->ptr[bufEntryIdx * TYPE_SIZE_SCAN]; // if needed, specialize TYPE_SIZE_SCAN
-            size_t hash = (size_t) entry->hashValue; // Global load (heavy)
-            const size_t posGlobal = hash & globalMask;
-            HashIndexedView::Entry* newEntry;
-            HashIndexedView::Entry* current;
-            HashIndexedView::Entry* exchanged;
-            do {
-                current=globalHt[posGlobal];
-                entry->next=current;
-                newEntry = tag(entry, current, hash);
-                exchanged = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[posGlobal], (unsigned long long)current, (unsigned long long)newEntry);
-            } while (exchanged!=current);
-            /*
-            const size_t posLocal = hash & scracthPadMask;
-            const int64_t writeOutPos = atomicCAS((unsigned long long*)&scracthPad[posLocal].writeOutPos, (unsigned long long)-1, (unsigned long long)posGlobal);
-            if(writeOutPos == -1 || writeOutPos == posGlobal){ // Was an empty SMEM slot, we just occupied it with posGlobal. OR matched the writeout position.
-                atomicAppendSMEM(scracthPad, posLocal, entry);
-            } else { // If we have a collision (scratch pad's entry writeout position != entry's writeOut pos) -> write directly to global.
-                atomicAppend(globalHt, posGlobal, entry);
-            }
-            */
-        }
+
+    // Iterator
+    FlexibleBufferIterator myIterator(buffer->getValuesPtr(), globalTid, numThreadsTotal);
+    HashIndexedView::Entry* entry = (HashIndexedView::Entry*)myIterator.initialize();
+    while(entry){
+        size_t hash = (size_t) entry->hashValue; // Global load (heavy)
+        const size_t posGlobal = hash & globalMask;
+        HashIndexedView::Entry* newEntry;
+        HashIndexedView::Entry* current;
+        HashIndexedView::Entry* exchanged;
+        do {
+            current=globalHt[posGlobal];
+            entry->next=current;
+            newEntry = tag(entry, current, hash);
+            exchanged = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[posGlobal], (unsigned long long)current, (unsigned long long)newEntry);
+        } while (exchanged!=current);
+        entry = (HashIndexedView::Entry*)myIterator.step();
     }
-    __syncthreads();
+
+    // Buffer-to-X 
+    // for(int bufIdx=bufferIdxStart; bufIdx<buffersCnt; bufIdx+=bufferIdxStep){  
+    //     auto* buffer = &values->getBuffers()[bufIdx];
+    //     const int entryCnt{buffer->numElements}; // Global load 
+    //     for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < entryCnt; bufEntryIdx+=bufferEntryIdxStep) { 
+    //         HashIndexedView::Entry* entry = (HashIndexedView::Entry*) &buffer->ptr[bufEntryIdx * TYPE_SIZE_SCAN]; // if needed, specialize TYPE_SIZE_SCAN
+    //         size_t hash = (size_t) entry->hashValue; // Global load (heavy)
+    //         const size_t posGlobal = hash & globalMask;
+    //         HashIndexedView::Entry* newEntry;
+    //         HashIndexedView::Entry* current;
+    //         HashIndexedView::Entry* exchanged;
+    //         do {
+    //             current=globalHt[posGlobal];
+    //             entry->next=current;
+    //             newEntry = tag(entry, current, hash);
+    //             exchanged = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[posGlobal], (unsigned long long)current, (unsigned long long)newEntry);
+    //         } while (exchanged!=current);
+    //     }
+    // }
+    // __syncthreads();
     // for(int i = threadIdx.x; i < scracthPadMask+1; i+=blockDim.x){
     //     if(scracthPad[i].head){
     //         atomicAppendSubList(view->ht, scracthPad[i].writeOutPos, scracthPad[i].head, scracthPad[i].tail);
@@ -381,197 +392,6 @@ ViewResult buildView(int* filterCol, int* keyCol, int* valCol, int numTuples){
     return res;
 }
 
-/*
-#include <cooperative_groups.h>
-namespace cg = cooperative_groups;
-__global__ void buildPreAggregationHashtableFragmentsAdvancedCG(
-        int* lo_orderdate, int* lo_partkey, int* lo_custkey, int* lo_suppkey, int* lo_revenue, int* lo_supplycost, int lo_len,
-        HashIndexedView* sView, HashIndexedView* cView, HashIndexedView* pView, HashIndexedView* dView, 
-        FlexibleBuffer** globalOutputs, size_t* htSizes) 
-    {
-    //  1024 threads per block, the maximum registers per thread is 64
-    const int warpCount = (blockDim.x + (WARP_SIZE-1)) / WARP_SIZE;
-    const int warpId = threadIdx.x / WARP_SIZE;
-    const int warpLane = threadIdx.x % WARP_SIZE;
-    const int numThreadsTotal = blockDim.x * gridDim.x;
-    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
-    const int globalWarpID = globalTid / WARP_SIZE;
-
-    constexpr size_t outputMask = PreAggregationHashtableFragment::numOutputs - 1;
-    constexpr size_t htShift = 6; 
-
-
-    // SMEM size is very important for reducing work in the merge phase. 
-    // Example RTX 2060, Q4.1. SF10: 2^10 leads to 10ms in merge, 2^12 leads to 170us-1ms(!) in merge.
-    // However, the fragment building phase remains bottlenecked by the read latency (scan of a large relation with probes).
-    const int powerTwoTemp{12}; 
-    const int scracthPadSize{1 << powerTwoTemp};
-    const size_t scracthPadMask{scracthPadSize - 1};
-
-    // __shared__ PreAggregationHashtableFragmentSMEM::Entry* scracthPad[scracthPadSize];
-    __shared__ char smem[
-        scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) 
-        + 4*sizeof(HashIndexedView) 
-        + sizeof(PreAggregationHashtableFragmentSMEM)];
-    PreAggregationHashtableFragmentSMEM::Entry** scracthPad = reinterpret_cast<PreAggregationHashtableFragmentSMEM::Entry**>(smem);
-    HashIndexedView* cachedView_S = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*));
-    HashIndexedView* cachedView_P = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + sizeof(HashIndexedView));
-    HashIndexedView* cachedView_D = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 2*sizeof(HashIndexedView));
-    HashIndexedView* cachedView_C = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 3*sizeof(HashIndexedView));
-    PreAggregationHashtableFragmentSMEM* myFrag = reinterpret_cast<PreAggregationHashtableFragmentSMEM*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 4*sizeof(HashIndexedView));
-    
-    cg::thread_block block = cg::this_thread_block();
-    for(int i = threadIdx.x; i < scracthPadSize; i+=blockDim.x){
-        scracthPad[i] = nullptr;
-    }
-    if(threadIdx.x == 0){
-        *cachedView_S = *sView;
-        *cachedView_P = *pView;
-        *cachedView_D = *dView;
-        *cachedView_C = *cView;
-        new(myFrag) PreAggregationHashtableFragmentSMEM(TYPE_SIZE_RES_HT, scracthPad, scracthPadSize);
-    }
-    block.sync();
-
-    // iterate over probe cols
-    int probeColIdxStart = globalTid;
-    int probeColIdxStep = numThreadsTotal;
-    int roundedSize = ((lo_len + 31) / 32) * 32; 
-    for(int probeColTupleIdx = probeColIdxStart; probeColTupleIdx < roundedSize; probeColTupleIdx+=probeColIdxStep){
-        cg::coalesced_group active = cg::coalesced_threads();
-        const bool remainInLoop{probeColTupleIdx < lo_len};
-        bool foundMatch{false}; // PROBING
-        GrowingBufEntryScan* current_C{nullptr}; // value cols
-        GrowingBufEntryScan* current_D{nullptr}; 
-        if(remainInLoop){
-        ////// PROBE S JOIN CONDITION //////
-        const int lo_key_S = lo_suppkey[probeColTupleIdx];
-        const uint32_t hash_S = hashInt32(lo_key_S);
-        const size_t pos_S = hash_S & cachedView_S->htMask;
-        GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_S->ht[pos_S], hash_S)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
-        while(current_S){ 
-            if (current_S->hashValue == hash_S && current_S->key == lo_key_S) { // STALLS!
-                ////// PROBE C JOIN CONDITION //////
-                const int lo_key_C = lo_custkey[probeColTupleIdx];
-                const uint32_t hash_C = hashInt32(lo_key_C);
-                const size_t pos_C = hash_C & cachedView_C->htMask;
-                current_C = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_C->ht[pos_C], hash_C)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
-                while(current_C){ 
-                    if (current_C->hashValue == hash_C && current_C->key == lo_key_C) {
-                        ////// PROBE P JOIN CONDITION //////
-                        const int lo_key_P = lo_partkey[probeColTupleIdx];
-                        const uint32_t hash_P = hashInt32(lo_key_P);
-                        const size_t pos_P = hash_P & cachedView_P->htMask;
-                        GrowingBufEntryScan* current_P = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_P->ht[pos_P], hash_P));
-                        while(current_P){
-                            if (current_P->hashValue == hash_P && current_P->key == lo_key_P) {
-                                ////// PROBE D JOIN CONDITION //////
-                                const int lo_key_D = lo_orderdate[probeColTupleIdx];
-                                const uint32_t hash_D = hashInt32(lo_key_D);
-                                const size_t pos_D = hash_D & cachedView_D->htMask;
-                                current_D = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_D->ht[pos_D], hash_D));
-                                while(current_D){
-                                    if(current_D->hashValue == hash_D && current_D->key == lo_key_D){
-                                        foundMatch = true;
-                                    }
-                                    if(foundMatch){break;}
-                                    current_D = current_D->next;
-                                }
-                            }
-                            if(foundMatch){break;}
-                            current_P = current_P->next;
-                        } 
-                    }
-                    if(foundMatch){break;}
-                    current_C = current_C->next;
-                }
-            }
-            if(foundMatch){break;}
-            current_S = current_S->next;
-        }
-        ////// [END] PROBE JOIN CONDITIONS //////
-        }
-        ////// INSERT/UPDATE PARTIAL AGGREGATE //////
-        bool needInsert{false};
-        int64_t hashGroupCols{-1};
-        int scracthPadPos{-1};
-        int outputPos{-1};
-        GrowingBufEntryResHT* partialAggEntry;
-        if(foundMatch){
-            hashGroupCols = combineHashes(hashInt32(current_D->value), hashInt32(current_C->value));
-            scracthPadPos = (hashGroupCols >> htShift) & scracthPadMask;
-            outputPos = hashGroupCols & PreAggregationHashtableFragmentSMEM::outputMask;
-            partialAggEntry = reinterpret_cast<GrowingBufEntryResHT*>(scracthPad[scracthPadPos]);
-            if(!partialAggEntry){ 
-                needInsert = true; // if no entry found (nullptr) at position
-            } else {
-                if(partialAggEntry->hashValue == hashGroupCols){ // Global load (stalls)
-                    // Q4.1. returns select d_year,c_nation,sum(lo_revenue-lo_supplycost) as profit 
-                    if(partialAggEntry->key[0] == current_D->value && partialAggEntry->key[1] == current_C->value){
-                        needInsert = false; // if found entry, hash and key match
-                    } else { 
-                        needInsert = true; // if key doesn't match, collision -> insert
-                    }
-                } else { 
-                    needInsert = true; // if hash doesn't match
-                }
-            }
-        }
-        uint32_t myIdx{-1};
-        int64_t value{-1};
-        // cg::coalesced_group sameOutputPosGroup = cg::labeled_partition(active, outputPos);
-        if(foundMatch){
-            value = lo_revenue[probeColTupleIdx] - lo_supplycost[probeColTupleIdx];
-            if(needInsert){
-                myIdx = atomicAdd(&myFrag->counters[outputPos], 1);
-            } else {
-                atomicAdd(reinterpret_cast<unsigned long long*>(&partialAggEntry->value), (long long)(value));
-            }
-        } 
-        block.sync();
-        for(int i = block.thread_rank(); i < PreAggregationHashtableFragmentSMEM::numOutputs; i+=block.size()){
-            // With accumulated counters, we pick per-partition thread that exclusively requests memory
-            myFrag->insertN(i); // thread-block sequence for an output is allocated
-        }
-        block.sync();
-
-        if(foundMatch && needInsert){
-            GrowingBufEntryResHT* myOffset = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->writeOffsets[outputPos]); // get allocated sequence for the output pos
-            myOffset[myIdx].hashValue = hashGroupCols;
-            myOffset[myIdx].key[0] = current_D->value; // index into the allocated sequence
-            myOffset[myIdx].key[1] = current_C->value;
-            myOffset[myIdx].value = value;
-            myOffset[myIdx].next=nullptr;
-            atomicExch((unsigned long long*)&scracthPad[scracthPadPos], (unsigned long long)&myOffset[myIdx]);
-        }
-        // block.sync();
-        // for(int i = block.thread_rank(); i < PreAggregationHashtableFragmentSMEM::numOutputs; i+=block.size()){
-        //     // With accumulated counters, we pick per-partition thread that exclusively requests memory
-        // }
-        // block.sync();
-        ////// [END] INSERT/UPDATE PARTIAL AGGREGATE //////
-    }
-    block.sync();
-
-    if(!warpLane){
-        int su = 0;
-        for(int i = 0; i < PreAggregationHashtableFragment::numOutputs; i++){
-            if(myFrag->outputs[i]){
-                atomicAdd((unsigned long long*)&htSizes[i], (unsigned long long)myFrag->outputs[i]->getLen());
-                su += myFrag->outputs[i]->getLen();
-            }
-            // printf("[buildPreAggr] outputs[%d] = %p\n", i, myFrag->outputs[i]);
-        }
-        memcpy(&globalOutputs[blockIdx.x * PreAggregationHashtableFragment::numOutputs], myFrag->outputs, sizeof(FlexibleBuffer *) * PreAggregationHashtableFragment::numOutputs);
-    }
-    ///////////////////////////////////////////
-    // if(!threadIdx.x){myFrag->print(printEntryResHT);}  // only for <<<1,X>>> debug
-
-    // if(!threadIdx.x){ // check that preAggrHT is initialized
-    //     buildStats.print();
-    // }
-}  
-*/
 constexpr int64_t highestPowerOfTwo(int64_t n) { return n == 0 ? 0 : 1LL << (63 - __builtin_clzll(n));}
 constexpr uint8_t powerOfTwo(int64_t n, int power = 0) {return (n == 1) ? power : powerOfTwo(n / 2, power + 1);}
 constexpr int64_t SMEM_SIZE{36 * KiB};

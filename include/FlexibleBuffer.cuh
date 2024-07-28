@@ -273,4 +273,46 @@ public:
         printf("-----------------------------------------------------------\n");
     }
 };
+
+class FlexibleBufferIterator {
+    FlexibleBuffer* parent;
+    uint32_t start{0};
+    uint32_t stride{0};
+    uint32_t bufferIndex{0};
+    uint32_t localIndex{0};
+
+    __device__ uint8_t* currentPointer() {
+        if (bufferIndex < parent->getBuffers().size()) {
+            return &parent->getBuffers()[bufferIndex].ptr[localIndex * parent->getTypeSize()];
+        } else {
+            return nullptr;
+        }
+    }
+public:
+    __device__ FlexibleBufferIterator(FlexibleBuffer* parent, uint32_t start, uint32_t stride) : parent(parent), start(start), stride(stride) {}
+
+    __device__ uint8_t* initialize() { // Given start, find position across buffers
+        uint32_t numBuffers = parent->getBuffers().size();
+        uint32_t remaining = start;
+        for (bufferIndex = 0; bufferIndex < numBuffers; ++bufferIndex) {
+            if (remaining < parent->getBuffers()[bufferIndex].numElements) {
+                localIndex = remaining;
+                return currentPointer();
+            }
+            remaining -= parent->getBuffers()[bufferIndex].numElements;
+        }
+        return nullptr; 
+    }
+
+    __device__ uint8_t* step() {
+        uint32_t numBuffers = parent->getBuffers().size();
+        if (bufferIndex >= numBuffers) return nullptr;
+        localIndex += stride;
+        while (bufferIndex < numBuffers && localIndex >= parent->getBuffers()[bufferIndex].numElements) {
+            localIndex -= parent->getBuffers()[bufferIndex].numElements;
+            bufferIndex++;
+        }
+        return currentPointer();
+    }
+};
 #endif // FLEXIBLEBUFFER_H
