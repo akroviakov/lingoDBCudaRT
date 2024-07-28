@@ -582,7 +582,7 @@ static constexpr uint64_t scracthPadMask{scracthPadSize-1};
 __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         int* lo_orderdate, int* lo_partkey, int* lo_custkey, int* lo_suppkey, int* lo_revenue, int* lo_supplycost, int lo_len,
         HashIndexedView* sView, HashIndexedView* cView, HashIndexedView* pView, HashIndexedView* dView, 
-        FlexibleBuffer** globalOutputs, size_t* htSizes) 
+        PreAggregationHashtableFragmentSMEM* fragments) 
     {
     //  1024 threads per block, the maximum registers per thread is 64
     const int warpCount = (blockDim.x + (WARP_SIZE-1)) / WARP_SIZE;
@@ -718,17 +718,18 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         ////// [END] INSERT/UPDATE PARTIAL AGGREGATE //////
     }
     __syncthreads();
-
-    if(!warpLane){
-        int su = 0;
-        for(int i = 0; i < PreAggregationHashtableFragment::numOutputs; i++){
-            if(myFrag->getPartition(i)){
-                atomicAdd((unsigned long long*)&htSizes[i], (unsigned long long)myFrag->getPartition(i)->getLen());
-                su += myFrag->getPartition(i)->getLen();
-            }
-            // printf("[buildPreAggr] outputs[%d] = %p\n", i, myFrag->outputs[i]);
+    for(uint32_t i = threadIdx.x; i < PreAggregationHashtableFragmentSMEM::numPartitions; i+=blockDim.x){
+        if(myFrag->getPartition(i)){
+            myFrag->sizes[i] = myFrag->getPartition(i)->getLen();
+        } else {
+            myFrag->sizes[i] = 0;
         }
-        memcpy(&globalOutputs[blockIdx.x * PreAggregationHashtableFragment::numOutputs], myFrag->getPartitionsPtr(), sizeof(FlexibleBuffer *) * PreAggregationHashtableFragment::numOutputs);
+    }
+    __syncthreads();
+    for(uint32_t i = threadIdx.x; i < sizeof(PreAggregationHashtableFragmentSMEM); i+=blockDim.x){
+        char* myFragAsChar = reinterpret_cast<char*>(myFrag);
+        char* globalFragAsChar = reinterpret_cast<char*>(&fragments[blockIdx.x]);
+        globalFragAsChar[i] = myFragAsChar[i];
     }
     ///////////////////////////////////////////
     // if(!threadIdx.x){myFrag->print(printEntryResHT);}  // only for <<<1,X>>> debug
@@ -782,7 +783,7 @@ __global__ void INITPreAggregationHashtableFragmentsSingleThread(PreAggregationH
 __global__ void mergePreAggregationHashtableFragments(
         PreAggregationHashtable* preAggrHT, 
         PreAggregationHashtable::PartitionHt* preAllocatedPartitions, 
-        FlexibleBuffer** globalOutputsVec, 
+        PreAggregationHashtableFragmentSMEM* fragments, 
         size_t numFrags) 
     {
     const int warpCount = (blockDim.x + (WARP_SIZE-1)) / WARP_SIZE;
@@ -808,7 +809,7 @@ __global__ void mergePreAggregationHashtableFragments(
     // __syncthreads();
     // printf("[MergePreAggr] numFrags=%lu\n", numFrags);
     for(int fragmentId = 0; fragmentId < numFrags; fragmentId++){ 
-        FlexibleBuffer* fragmentPartitionBuffer = globalOutputsVec[fragmentId * 64 + partitionId];
+        FlexibleBuffer* fragmentPartitionBuffer = fragments[fragmentId].getPartition(partitionId);
         // printf("[MergePreAggr][fragmentId=%d] fragmentPartitionBuffer=%p\n",fragmentId, fragmentPartitionBuffer);
         if(!fragmentPartitionBuffer){continue;} // many stalls, long scoreboard
         const int buffersCnt{fragmentPartitionBuffer->getBuffers().size()};
@@ -880,24 +881,17 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         ViewResult dView = buildView<TABLE::D>(nullptr, d_datekey, d_year, d_len);
         std::cout << "** BUILT HASH VIEWS **" << std::endl;
         std::cout << "** BUILDING PREAGGREGATION FRAGMENTS **" << std::endl;
-
-        FlexibleBuffer** allOutputs_d; // store warp-level fragment's partition's FlexibleBuffers (X warps * 64 partitions)
-        size_t* d_outputsSizes; // store partition sizes
-        size_t* h_outputsSizes;
-        CHECK_CUDA_ERROR(cudaMallocHost(&h_outputsSizes, sizeof(size_t) * 64));
-        CHECK_CUDA_ERROR(cudaMalloc(&d_outputsSizes, sizeof(size_t) * 64));
-        cudaMemset(d_outputsSizes, 0, sizeof(size_t) * 64); // sizes are accumulated, so first init to 0 
-        
-        const size_t numBlocks = 30;
+        const size_t numFragments = 30;
         const size_t numThreadsInBlockPreAggr = 1024;
-        const size_t numFragments = max(1ul,(numBlocks));
-        const size_t outputsPointersArraySize = sizeof(FlexibleBuffer*) * (64 * numFragments); // each fragment has 64 partitions
-        CHECK_CUDA_ERROR(cudaMalloc(&allOutputs_d, outputsPointersArraySize)); 
+        PreAggregationHashtableFragmentSMEM* fragments_d;
+        PreAggregationHashtableFragmentSMEM* fragments_h;
+        CHECK_CUDA_ERROR(cudaMallocHost(&fragments_h, numFragments * sizeof(PreAggregationHashtableFragmentSMEM)));
+        CHECK_CUDA_ERROR(cudaMalloc(&fragments_d, numFragments * sizeof(PreAggregationHashtableFragmentSMEM)));
         // std::cout << "[buildPreAggregationHashtableFragments] Launch config: <<<" <<numBlocks << ","<<numThreadsInBlockPreAggr <<  ">>>\n";
-        buildPreAggregationHashtableFragmentsAdvanced<<<numBlocks,numThreadsInBlockPreAggr>>>(
+        buildPreAggregationHashtableFragmentsAdvanced<<<numFragments, numThreadsInBlockPreAggr>>>(
             lo_orderdate, lo_partkey, lo_custkey, lo_suppkey, lo_revenue, lo_supplycost, lo_len,
             sView.d_hash_view, cView.d_hash_view, pView.d_hash_view, dView.d_hash_view, 
-            allOutputs_d, d_outputsSizes
+            fragments_d
         );
         cudaDeviceSynchronize();
         CHECK_CUDA_ERROR(cudaGetLastError());
@@ -905,19 +899,21 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         std::cout << "** BUILT PREAGGREGATION FRAGMENTS **" << std::endl;
         std::cout << "** MERGING PREAGGREGATION FRAGMENTS **" << std::endl;
 
-        CHECK_CUDA_ERROR(cudaMemcpy(h_outputsSizes, d_outputsSizes, sizeof(size_t) * 64, cudaMemcpyDeviceToHost)); // get sizes back
+        CHECK_CUDA_ERROR(cudaMemcpy(fragments_h, fragments_d, numFragments * sizeof(PreAggregationHashtableFragmentSMEM), cudaMemcpyDeviceToHost)); // get sizes back
         PreAggregationHashtable::PartitionHt* d_preAllocatedPartitions;
         PreAggregationHashtable::PartitionHt* h_preAllocatedPartitions;
         CHECK_CUDA_ERROR(cudaMalloc(&d_preAllocatedPartitions, sizeof(PreAggregationHashtable::PartitionHt) * 64));
         CHECK_CUDA_ERROR(cudaMallocHost(&h_preAllocatedPartitions, sizeof(PreAggregationHashtable::PartitionHt) * 64));
 
-        for(int outputId = 0; outputId < PreAggregationHashtableFragment::numOutputs; outputId++){ // allocate ht buffers for each final partition
-            auto [htAllocSize, htMask] = getHtSizeMask(h_outputsSizes[outputId], sizeof(PreAggregationHashtableFragment::Entry*));
-            h_preAllocatedPartitions[outputId].hashMask = htMask;
-            CHECK_CUDA_ERROR(cudaMalloc(&h_preAllocatedPartitions[outputId].ht, htAllocSize));
-            CHECK_CUDA_ERROR(cudaMemset(h_preAllocatedPartitions[outputId].ht, 0, htAllocSize));
-            // totalSum += outputsSizes_h[outputId];
-            // std::cout << "[HOST][ALLOCATE FINAL HT PARTITION "<< outputId << "], given size " << outputsSizes_h[outputId] << ": allocSize=" << htAllocSize << " B, at " << preAllocatedPartitions_h[outputId].ht << ", ht mask is " << htMask << "\n";
+        for(int partitionID = 0; partitionID < PreAggregationHashtableFragmentSMEM::numPartitions; partitionID++){
+            uint64_t partitionSize = 0;
+            for(int fragId = 0; fragId < numFragments; fragId++){
+                partitionSize += fragments_h[fragId].sizes[partitionID];
+            }
+            auto [htAllocSize, htMask] = getHtSizeMask(partitionSize, sizeof(PreAggregationHashtableFragment::Entry*));
+            h_preAllocatedPartitions[partitionID].hashMask = htMask;
+            CHECK_CUDA_ERROR(cudaMalloc(&h_preAllocatedPartitions[partitionID].ht, htAllocSize));
+            CHECK_CUDA_ERROR(cudaMemset(h_preAllocatedPartitions[partitionID].ht, 0, htAllocSize));
         }
         // std::cout << "[Merge HT FRAGMENTS] Total size = " << totalSum << ", num fragments " << numFragments << "\n";
         CHECK_CUDA_ERROR(cudaMemcpy(d_preAllocatedPartitions, h_preAllocatedPartitions, sizeof(PreAggregationHashtable::PartitionHt) * 64, cudaMemcpyHostToDevice));
@@ -928,7 +924,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         CHECK_CUDA_ERROR(cudaMalloc(&d_result_preAggrHT, sizeof(PreAggregationHashtable)));
 
         INITPreAggregationHashtableFragmentsSingleThread<<<1,1>>>(d_result_preAggrHT, d_preAllocatedPartitions);
-        mergePreAggregationHashtableFragments<<<64,512>>>(d_result_preAggrHT, d_preAllocatedPartitions, allOutputs_d, numFragments);
+        mergePreAggregationHashtableFragments<<<64,512>>>(d_result_preAggrHT, d_preAllocatedPartitions, fragments_d, numFragments);
         printPreAggregationHashtable<<<1,1>>>(d_result_preAggrHT, false);
         cudaDeviceSynchronize();
         CHECK_CUDA_ERROR(cudaGetLastError());
@@ -955,9 +951,8 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         CHECK_CUDA_ERROR(cudaFreeHost(h_preAllocatedPartitions));
         CHECK_CUDA_ERROR(cudaFree(d_preAllocatedPartitions));
 
-        CHECK_CUDA_ERROR(cudaFree(allOutputs_d));
-        CHECK_CUDA_ERROR(cudaFreeHost(h_outputsSizes));
-        CHECK_CUDA_ERROR(cudaFree(d_outputsSizes));
+        CHECK_CUDA_ERROR(cudaFree(fragments_d));
+        CHECK_CUDA_ERROR(cudaFreeHost(fragments_h));
 
         for(int outputId = 0; outputId < PreAggregationHashtableFragment::numOutputs; outputId++){
             CHECK_CUDA_ERROR(cudaFree(h_preAllocatedPartitions[outputId].ht));

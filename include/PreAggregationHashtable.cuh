@@ -23,12 +23,13 @@ class PreAggregationHashtableFragmentSMEM {
     };
     private:
     FlexibleBuffer* partitions[numPartitions];
-    uint64_t typeSize;
-    uint64_t len{0};
+    uint32_t len{0};
+    uint32_t typeSize;
     public:
-    __device__ PreAggregationHashtableFragmentSMEM(size_t typeSize) : typeSize(typeSize){
-    }  
-    __device__ __forceinline__ FlexibleBuffer* getPartition(uint32_t partitionID) {return partitions[partitionID];} 
+    uint32_t sizes[numPartitions];
+
+    __device__ PreAggregationHashtableFragmentSMEM(uint32_t typeSize) : typeSize(typeSize){}  
+    __host__ __device__ __forceinline__ FlexibleBuffer* getPartition(uint32_t partitionID) {return partitions[partitionID];} 
     __device__ __forceinline__ FlexibleBuffer** getPartitionsPtr() {return partitions;} 
 
     __device__ __forceinline__ Entry* insertWarpOpportunistic(const uint64_t hash, int maskInsert) {
