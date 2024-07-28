@@ -12,7 +12,7 @@ constexpr uint64_t KiB = 1024;
 constexpr uint64_t MiB = 1024 * KiB;
 constexpr uint64_t GiB = 1024 * MiB;
 constexpr uint64_t HEAP_SIZE{3*GiB};
-constexpr uint64_t NUM_RUNS = 2;
+constexpr uint64_t NUM_RUNS = 3;
 
 int sf=1;
 
@@ -372,7 +372,7 @@ ViewResult buildView(int* filterCol, int* keyCol, int* valCol, int numTuples){
     growingBufferInit<<<1,1>>>(res.d_filter_scan);
     // If you execute __syncthreads() to synchronize the threads of a block, it is recommended to have more than the achieved 1 blocks per multiprocessor. 
     // This way, blocks that aren't waiting for __syncthreads() can keep the hardware busy
-    growingBufferFillTB<Table><<<30,1024>>>(filterCol, keyCol, valCol, numTuples, res.d_filter_scan); 
+    growingBufferFillTB<Table><<<30,512>>>(filterCol, keyCol, valCol, numTuples, res.d_filter_scan); 
     cudaDeviceSynchronize();
     CHECK_CUDA_ERROR(cudaGetLastError());
 
@@ -392,6 +392,8 @@ ViewResult buildView(int* filterCol, int* keyCol, int* valCol, int numTuples){
     return res;
 }
 
+__device__ __forceinline__ void prefetch_l2(const void *p) {asm("prefetch.global.L2 [%0];" : : "l"(p));}
+__device__ __forceinline__ void prefetch_l1(const void *p) {asm("prefetch.global.L1 [%0];" : : "l"(p));}
 constexpr int64_t highestPowerOfTwo(int64_t n) { return n == 0 ? 0 : 1LL << (63 - __builtin_clzll(n));}
 constexpr uint8_t powerOfTwo(int64_t n, int power = 0) {return (n == 1) ? power : powerOfTwo(n / 2, power + 1);}
 constexpr int64_t SMEM_SIZE{36 * KiB};
@@ -444,12 +446,17 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         GrowingBufEntryScan* current_C{nullptr}; // value cols
         GrowingBufEntryScan* current_D{nullptr}; 
         if(remainInLoop){
+        // prefetch_l1(&lo_suppkey[probeColTupleIdx + probeColIdxStep]);
+        // prefetch_l1(&lo_custkey[probeColTupleIdx + probeColIdxStep]);
+        // prefetch_l1(&lo_partkey[probeColTupleIdx + probeColIdxStep]);
+        // prefetch_l1(&lo_orderdate[probeColTupleIdx + probeColIdxStep]);
         ////// PROBE S JOIN CONDITION //////
         const int lo_key_S = lo_suppkey[probeColTupleIdx];
         const uint64_t hash_S = hashInt32ToInt64(lo_key_S);
         const size_t pos_S = hash_S & cachedView_S->htMask;
         GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_S->ht[pos_S], hash_S)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
         while(current_S){ 
+            prefetch_l1(&current_S->next);
             if (current_S->hashValue == hash_S && current_S->key == lo_key_S) { // STALLS!
                 ////// PROBE C JOIN CONDITION //////
                 const int lo_key_C = lo_custkey[probeColTupleIdx];
@@ -457,6 +464,7 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
                 const size_t pos_C = hash_C & cachedView_C->htMask;
                 current_C = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_C->ht[pos_C], hash_C)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
                 while(current_C){ 
+                    prefetch_l1(&current_C->next);
                     if (current_C->hashValue == hash_C && current_C->key == lo_key_C) {
                         ////// PROBE P JOIN CONDITION //////
                         const int lo_key_P = lo_partkey[probeColTupleIdx];
@@ -553,7 +561,7 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
 __global__ void printPreAggregationHashtable(PreAggregationHashtable* ht, bool printEmpty=false) {
     printf("---------------------PreAggregationHashtable [%p]-------------------------\n", ht);
     int resCnt{0};
-    for(int p = 0; p < PreAggregationHashtableFragment::numOutputs; p++){
+    for(int p = 0; p < PreAggregationHashtableFragmentSMEM::numPartitions; p++){
         for(int i = 0; i < ht->ht[p].hashMask+1; i++){
             GrowingBufEntryResHT* curr = reinterpret_cast<GrowingBufEntryResHT*>(ht->ht[p].ht[i]);
             if(!printEmpty && !curr){continue;}
@@ -628,8 +636,8 @@ __global__ void mergePreAggregationHashtableFragments(
             Buffer* buf = &fragmentPartitionBuffer->getBuffers().payLoad[bufferIdx];
             const int elemsCnt{buf->numElements};
             for (int elementIdx = threadIdx.x; elementIdx < buf->numElements; elementIdx+=blockDim.x) {
-                PreAggregationHashtableFragment::Entry* curr = reinterpret_cast<PreAggregationHashtableFragment::Entry*>(&buf->ptr[elementIdx * TYPE_SIZE_RES_HT]); // Global load
-                const size_t pos = curr->hashValue >> PreAggregationHashtableFragment::htShift & htMask; // Global load
+                PreAggregationHashtableFragmentSMEM::Entry* curr = reinterpret_cast<PreAggregationHashtableFragmentSMEM::Entry*>(&buf->ptr[elementIdx * TYPE_SIZE_RES_HT]); // Global load
+                const size_t pos = curr->hashValue >> PreAggregationHashtableFragmentSMEM::partitionShift & htMask; // Global load
                 
                 // printf("[Partition %d][POS %lu] MERGING hash=%llu, key1=%d, key2=%d\n", partitionId, pos, p->hashValue, p->key[0], p->key[1]);
                 // PreAggregationHashtable::Entry* currCandidate = untag(ht[pos]);
@@ -674,9 +682,9 @@ __global__ void freeKernel(GrowingBuffer* finalBuffer) {
     finalBuffer->~GrowingBuffer();
 }
 
-__global__ void freeFragments(PreAggregationHashtableFragment* partitions, int numPartitions) {
-    for(int i = 0; i < numPartitions; i++){
-        partitions[i].~PreAggregationHashtableFragment();
+__global__ void freeFragments(PreAggregationHashtableFragmentSMEM* partitions, int numPartitions) {
+    for(int i = threadIdx.x; i < numPartitions; i+=blockDim.x){
+        partitions[i].~PreAggregationHashtableFragmentSMEM();
     }
 }
 
@@ -693,7 +701,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         std::cout << "** BUILT HASH VIEWS **" << std::endl;
         std::cout << "** BUILDING PREAGGREGATION FRAGMENTS **" << std::endl;
         const size_t numFragments = 30;
-        const size_t numThreadsInBlockPreAggr = 1024;
+        const size_t numThreadsInBlockPreAggr = 640;
         PreAggregationHashtableFragmentSMEM* fragments_d;
         PreAggregationHashtableFragmentSMEM* fragments_h;
         CHECK_CUDA_ERROR(cudaMallocHost(&fragments_h, numFragments * sizeof(PreAggregationHashtableFragmentSMEM)));
@@ -721,7 +729,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
             for(int fragId = 0; fragId < numFragments; fragId++){
                 partitionSize += fragments_h[fragId].getPartitionPtr(partitionID)->getLen();
             }
-            auto [htAllocSize, htMask] = getHtSizeMask(partitionSize, sizeof(PreAggregationHashtableFragment::Entry*));
+            auto [htAllocSize, htMask] = getHtSizeMask(partitionSize, sizeof(PreAggregationHashtableFragmentSMEM::Entry*));
             h_preAllocatedPartitions[partitionID].hashMask = htMask;
             CHECK_CUDA_ERROR(cudaMalloc(&h_preAllocatedPartitions[partitionID].ht, htAllocSize));
             CHECK_CUDA_ERROR(cudaMemset(h_preAllocatedPartitions[partitionID].ht, 0, htAllocSize));
@@ -748,6 +756,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         freeKernel<<<1,1>>>(cView.d_filter_scan);
         freeKernel<<<1,1>>>(pView.d_filter_scan);
         freeKernel<<<1,1>>>(dView.d_filter_scan);
+        freeFragments<<<1,32>>>(fragments_d, numFragments);
         CHECK_CUDA_ERROR(cudaFree(sView.h_hash_view->ht));
         CHECK_CUDA_ERROR(cudaFree(cView.h_hash_view->ht));
         CHECK_CUDA_ERROR(cudaFree(pView.h_hash_view->ht));
@@ -765,7 +774,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         CHECK_CUDA_ERROR(cudaFree(fragments_d));
         CHECK_CUDA_ERROR(cudaFreeHost(fragments_h));
 
-        for(int outputId = 0; outputId < PreAggregationHashtableFragment::numOutputs; outputId++){
+        for(int outputId = 0; outputId < PreAggregationHashtableFragmentSMEM::numPartitions; outputId++){
             CHECK_CUDA_ERROR(cudaFree(h_preAllocatedPartitions[outputId].ht));
         }
 
@@ -788,7 +797,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         CHECK_CUDA_ERROR(cudaFree(dView.d_filter_scan));
         CHECK_CUDA_ERROR(cudaFreeHost(dView.h_filter_scan));
         CHECK_CUDA_ERROR(cudaFreeHost(dView.h_hash_view));
-
+        // printMallocInfo<<<1,1>>>();
         return 1.1;
     }
 
