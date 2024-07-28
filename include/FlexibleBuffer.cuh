@@ -195,7 +195,6 @@ class FlexibleBuffer {
     uint32_t totalLen{0};
     uint32_t currCapacity{0};
     uint32_t typeSize{0};
-    uint32_t lock{0};
 
     __device__ uint8_t* allocCurrentCapacity() {
         return reinterpret_cast<uint8_t*>(memAlloc(currCapacity * typeSize));
@@ -208,6 +207,8 @@ class FlexibleBuffer {
     }
 
 public:
+    uint32_t lock{0};
+
     __device__ FlexibleBuffer(){}
     __device__ FlexibleBuffer(uint32_t initialCapacity, uint32_t typeSize, const Buffer& firstBuf) : totalLen(firstBuf.numElements), currCapacity(initialCapacity), typeSize(typeSize) {
         buffers.push_back(firstBuf);

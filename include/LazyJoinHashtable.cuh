@@ -14,7 +14,7 @@ class HashIndexedView {
       //kv follows
    };
    Entry** ht;
-   size_t htMask; //NOLINT(clang-diagnostic-unused-private-field)
+   uint64_t htMask; //NOLINT(clang-diagnostic-unused-private-field)
    __host__ __device__ static uint64_t nextPow2(uint64_t v) {
       v--;
       v |= v >> 1;
@@ -32,7 +32,7 @@ class HashIndexedView {
    __device__ ~HashIndexedView();
    __device__ void print(){
       printf("--------------------HashIndexedView [%p]--------------------\n", this);
-      printf("htMask= %lu, ht**=%p\n", htMask, ht);
+      printf("htMask= %llu, ht**=%p\n", htMask, ht);
       for(int i = 0; i < htMask+1; i++){
          if(ht[i]){
             printf("[HT SLOT %d]: ht[i] = %p : {next = %p, hash = %llu}\n", i, ht[i], ht[i]->next, ht[i]->hashValue);

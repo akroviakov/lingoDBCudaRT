@@ -655,23 +655,19 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
                                         foundMatch = true;
                                     }
                                     if(foundMatch){break;}
-                                    // current_D = current_D->next;
                                     current_D = filterTagged(current_D->next, hash_D);
                                 }
                             }
                             if(foundMatch){break;}
                             current_P = filterTagged(current_P->next, hash_P);
-                            // current_P = current_P->next;
                         } 
                     }
                     if(foundMatch){break;}
                     current_C = filterTagged(current_C->next, hash_C);
-                    // current_C = current_C->next;
                 }
             }
             if(foundMatch){break;}
             current_S = filterTagged(current_S->next, hash_S);
-            // current_S = current_S->next;
         }
         ////// [END] PROBE JOIN CONDITIONS //////
         }
@@ -710,33 +706,28 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
                 myEntry->key[1] = current_C->value;
                 myEntry->value = value;
                 myEntry->next=nullptr;
-                atomicExch((unsigned long long*)&scracthPad[scracthPadPos], (unsigned long long)myEntry);
+                atomicExch_block(reinterpret_cast<unsigned long long*>(&scracthPad[scracthPadPos]), (unsigned long long)myEntry);
             } else {
                 atomicAdd(reinterpret_cast<unsigned long long*>(&partialAggEntry->value), (long long)(value));
+                
+                // Complex values may be unable to use atomics -> lock
+                // GrowingBufEntryResHT* next;
+                // do{
+                //     next = (GrowingBufEntryResHT*)atomicExch((unsigned long long*)&partialAggEntry->next, 1ull);
+                // } while((unsigned long long)next == 1ull);
+                // partialAggEntry->value += value;
+                // atomicExch((unsigned long long*)&partialAggEntry->next, (unsigned long long)next);
             }
         } 
         ////// [END] INSERT/UPDATE PARTIAL AGGREGATE //////
     }
     __syncthreads();
-    for(uint32_t i = threadIdx.x; i < PreAggregationHashtableFragmentSMEM::numPartitions; i+=blockDim.x){
-        if(myFrag->getPartition(i)){
-            myFrag->sizes[i] = myFrag->getPartition(i)->getLen();
-        } else {
-            myFrag->sizes[i] = 0;
-        }
-    }
-    __syncthreads();
-    for(uint32_t i = threadIdx.x; i < sizeof(PreAggregationHashtableFragmentSMEM); i+=blockDim.x){
+    for(uint32_t i = threadIdx.x; i < sizeof(PreAggregationHashtableFragmentSMEM); i+=blockDim.x){ // cooperate on copy
         char* myFragAsChar = reinterpret_cast<char*>(myFrag);
         char* globalFragAsChar = reinterpret_cast<char*>(&fragments[blockIdx.x]);
         globalFragAsChar[i] = myFragAsChar[i];
     }
     ///////////////////////////////////////////
-    // if(!threadIdx.x){myFrag->print(printEntryResHT);}  // only for <<<1,X>>> debug
-
-    // if(!threadIdx.x){ // check that preAggrHT is initialized
-    //     buildStats.print();
-    // }
 }  
 
 __global__ void printPreAggregationHashtable(PreAggregationHashtable* ht, bool printEmpty=false) {
@@ -809,9 +800,9 @@ __global__ void mergePreAggregationHashtableFragments(
     // __syncthreads();
     // printf("[MergePreAggr] numFrags=%lu\n", numFrags);
     for(int fragmentId = 0; fragmentId < numFrags; fragmentId++){ 
-        FlexibleBuffer* fragmentPartitionBuffer = fragments[fragmentId].getPartition(partitionId);
+        FlexibleBuffer* fragmentPartitionBuffer = fragments[fragmentId].getPartitionPtr(partitionId);
         // printf("[MergePreAggr][fragmentId=%d] fragmentPartitionBuffer=%p\n",fragmentId, fragmentPartitionBuffer);
-        if(!fragmentPartitionBuffer){continue;} // many stalls, long scoreboard
+        if(!fragmentPartitionBuffer->getTypeSize()){continue;} // many stalls, long scoreboard
         const int buffersCnt{fragmentPartitionBuffer->getBuffers().size()};
         for(int bufferIdx = partitionWorkerId; bufferIdx < buffersCnt; bufferIdx+=stride){
             Buffer* buf = &fragmentPartitionBuffer->getBuffers().payLoad[bufferIdx];
@@ -908,7 +899,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         for(int partitionID = 0; partitionID < PreAggregationHashtableFragmentSMEM::numPartitions; partitionID++){
             uint64_t partitionSize = 0;
             for(int fragId = 0; fragId < numFragments; fragId++){
-                partitionSize += fragments_h[fragId].sizes[partitionID];
+                partitionSize += fragments_h[fragId].getPartitionPtr(partitionID)->getLen();
             }
             auto [htAllocSize, htMask] = getHtSizeMask(partitionSize, sizeof(PreAggregationHashtableFragment::Entry*));
             h_preAllocatedPartitions[partitionID].hashMask = htMask;

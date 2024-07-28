@@ -22,37 +22,28 @@ class PreAggregationHashtableFragmentSMEM {
         //kv follows
     };
     private:
-    FlexibleBuffer* partitions[numPartitions];
+    FlexibleBuffer partitions[numPartitions];
     uint32_t len{0};
     uint32_t typeSize;
     public:
-    uint32_t sizes[numPartitions];
 
     __device__ PreAggregationHashtableFragmentSMEM(uint32_t typeSize) : typeSize(typeSize){}  
-    __host__ __device__ __forceinline__ FlexibleBuffer* getPartition(uint32_t partitionID) {return partitions[partitionID];} 
-    __device__ __forceinline__ FlexibleBuffer** getPartitionsPtr() {return partitions;} 
+    __host__ __device__ __forceinline__ FlexibleBuffer* getPartitionPtr(uint32_t partitionID) {return &partitions[partitionID];} 
 
-    __device__ __forceinline__ Entry* insertWarpOpportunistic(const uint64_t hash, int maskInsert) {
+    __device__ __forceinline__ Entry* insertWarpOpportunistic(const uint64_t hash, const int maskInsert) {
         const uint32_t partitionID = hash & partitionMask;
-        const int mask=__match_any_sync(maskInsert, partitionID);
+        const int mask{__match_any_sync(maskInsert, partitionID)};
         const int numWriters{__popc(mask)};
         const int leader{__ffs(mask)-1};
         const int lane{threadIdx.x % 32};
 
         Entry* newEntry{nullptr};
         if(lane == leader){
-            FlexibleBuffer* takeBuffer; // take ownership over a partition (i.e., acquire lock)
-            do {
-                takeBuffer = reinterpret_cast<FlexibleBuffer*>(atomicExch((unsigned long long*)&partitions[partitionID], 1ull));
-            }
-            while((unsigned long long)takeBuffer == 1ull);
-            if (!takeBuffer) { 
-                takeBuffer = (FlexibleBuffer*)memAlloc(sizeof(FlexibleBuffer));
-                new (takeBuffer) FlexibleBuffer(256, typeSize, true);
-            }
-            newEntry = reinterpret_cast<Entry*>(takeBuffer->insert(numWriters));
-            // printf("[LEADER TID %d, output=%d] got ptr %p, numWriters=%d\n", threadIdx.x, outputPos, newEntry, numWriters);
-            atomicExch((unsigned long long*)&partitions[partitionID], (unsigned long long)takeBuffer); // release lock
+            while(atomicExch(&partitions[partitionID].lock, 1u) == 1u){};
+            if(!partitions[partitionID].getTypeSize())
+                partitions[partitionID].lateInit(typeSize, 256);
+            newEntry = reinterpret_cast<Entry*>(partitions[partitionID].insert(numWriters));
+            atomicExch(&partitions[partitionID].lock, 0u); // release lock
         }
         if(numWriters > 1){
             const int laneOffset = __popc(mask & ((1U << lane) - 1));
@@ -63,28 +54,21 @@ class PreAggregationHashtableFragmentSMEM {
         return newEntry;
     }
 
-    __device__ ~PreAggregationHashtableFragmentSMEM(){
-        for(size_t i=0;i<numPartitions;i++){
-            if(partitions[i]){
-                partitions[i]->~FlexibleBuffer();
-                freePtr(partitions[i]);
-            }
-        }
-    }
+    __device__ ~PreAggregationHashtableFragmentSMEM(){}
 
     __device__ void print( void (*printEntry)(uint8_t*) = nullptr){
         printf("--------------------PreAggregationHashtableFragmentSMEM [%p]--------------------\n", this);
         size_t countValidPartitions{0};
         size_t countFlexibleBufferLen{0};
         for(int i = 0; i < numPartitions; i++){
-            countValidPartitions += (partitions[i] != nullptr);
+            countValidPartitions += (partitions[i].getTypeSize() != 0);
         }
         printf("typeSize=%lu, len=%lu, %lu non-empty partitions out of %lu\n", typeSize, len, countValidPartitions, numPartitions);
         for(int i = 0; i < numPartitions; i++){
-            if(partitions[i]){
+            if(partitions[i].getTypeSize()){
                 printf("[Partition %d] ", i);
-                partitions[i]->print(printEntry);
-                countFlexibleBufferLen += partitions[i]->getLen();
+                partitions[i].print(printEntry);
+                countFlexibleBufferLen += partitions[i].getLen();
                 printf("[END Partition %d] \n", i);
             }
         }
