@@ -37,11 +37,11 @@ __device__ T* tag(T* ptr, T* previousPtr, uint64_t hash) {
 }
 
 template <typename T>
-__device__ T* filterTagged(T* ptr, uint64_t hash) {
+__device__ T* filterTagged(T* ptr, uint64_t hash, const uint16_t* SMEMmask) {
    constexpr uint64_t ptrMask = 0x0000ffffffffffffull;
    constexpr uint64_t tagMask = 0xffff000000000000ull;
    uint64_t asInt = reinterpret_cast<uint64_t>(ptr);
-   uint64_t requiredTag = bloomMasks[ hash >> (64-11)];
+   uint64_t requiredTag = SMEMmask[ hash >> (64-11)];
    requiredTag=requiredTag<<48;
    uint64_t currentTag = asInt & tagMask;
    return ((currentTag | requiredTag) == currentTag) ? reinterpret_cast<T*>(asInt & ptrMask) : nullptr;

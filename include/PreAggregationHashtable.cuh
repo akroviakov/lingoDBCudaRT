@@ -122,15 +122,15 @@ class PreAggregationHashtable {
         printf("----------------[END] PreAggregationHashtable [%p]--------------------\n", this);
 
     }
-    __device__ Entry* lookup(size_t hash){
-        constexpr size_t partitionMask = PreAggregationHashtableFragmentSMEM::numPartitions - 1;
-        auto partition = hash & partitionMask;
-        if (!ht[partition].ht) {
-            return nullptr;
-        } else {
-            return filterTagged(ht[partition].ht[ht[partition].hashMask & hash >> 6], hash);
-        }
-    }
+    // __device__ Entry* lookup(size_t hash){
+    //     constexpr size_t partitionMask = PreAggregationHashtableFragmentSMEM::numPartitions - 1;
+    //     auto partition = hash & partitionMask;
+    //     if (!ht[partition].ht) {
+    //         return nullptr;
+    //     } else {
+    //         return filterTagged(ht[partition].ht[ht[partition].hashMask & hash >> 6], hash);
+    //     }
+    // }
 
 
     // __host__ void lock(Entry* entry,size_t subtract){

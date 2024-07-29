@@ -12,7 +12,7 @@ constexpr uint64_t KiB = 1024;
 constexpr uint64_t MiB = 1024 * KiB;
 constexpr uint64_t GiB = 1024 * MiB;
 constexpr uint64_t HEAP_SIZE{3*GiB};
-constexpr uint64_t NUM_RUNS = 3;
+constexpr uint64_t NUM_RUNS = 40;
 
 int sf=1;
 
@@ -392,6 +392,12 @@ ViewResult buildView(int* filterCol, int* keyCol, int* valCol, int numTuples){
     return res;
 }
 
+__device__ __forceinline__ int uncachedReadCS(int* ptr) {
+    int value;
+    asm volatile("ld.cs.b32 %0, [%1];" : "=r"(value) : "l"(ptr));
+    return value;
+}
+
 __device__ __forceinline__ void prefetch_l2(const void *p) {asm("prefetch.global.L2 [%0];" : : "l"(p));}
 __device__ __forceinline__ void prefetch_l1(const void *p) {asm("prefetch.global.L1 [%0];" : : "l"(p));}
 constexpr int64_t highestPowerOfTwo(int64_t n) { return n == 0 ? 0 : 1LL << (63 - __builtin_clzll(n));}
@@ -417,17 +423,22 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
     __shared__ char smem[
         scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) 
         + 4*sizeof(HashIndexedView) 
-        + sizeof(PreAggregationHashtableFragmentSMEM)];
+        + sizeof(PreAggregationHashtableFragmentSMEM)
+        + sizeof(uint16_t) * 2048];
     PreAggregationHashtableFragmentSMEM::Entry** scracthPad = reinterpret_cast<PreAggregationHashtableFragmentSMEM::Entry**>(smem);
     HashIndexedView* cachedView_S = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*));
     HashIndexedView* cachedView_P = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + sizeof(HashIndexedView));
     HashIndexedView* cachedView_D = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 2*sizeof(HashIndexedView));
     HashIndexedView* cachedView_C = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 3*sizeof(HashIndexedView));
     PreAggregationHashtableFragmentSMEM* myFrag = reinterpret_cast<PreAggregationHashtableFragmentSMEM*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 4*sizeof(HashIndexedView));
-
+    uint16_t* bloomMasksMyMask = reinterpret_cast<uint16_t*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 4*sizeof(HashIndexedView) + sizeof(PreAggregationHashtableFragmentSMEM));
     for(int i = threadIdx.x; i < scracthPadSize; i+=blockDim.x){
         scracthPad[i] = nullptr;
     }
+    for(int i = threadIdx.x; i < 2048; i+=blockDim.x){
+        bloomMasksMyMask[i] = bloomMasks[i];
+    }
+    const uint16_t* bloomMasksMy = bloomMasksMyMask;
     if(threadIdx.x == 0){
         *cachedView_S = *sView;
         *cachedView_P = *pView;
@@ -451,51 +462,52 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         // prefetch_l1(&lo_partkey[probeColTupleIdx + probeColIdxStep]);
         // prefetch_l1(&lo_orderdate[probeColTupleIdx + probeColIdxStep]);
         ////// PROBE S JOIN CONDITION //////
-        const int lo_key_S = lo_suppkey[probeColTupleIdx];
+        // __ldg - may get cached in the read-only data cache (not L1)
+        const int lo_key_S = uncachedReadCS(&lo_suppkey[probeColTupleIdx]);
         const uint64_t hash_S = hashInt32ToInt64(lo_key_S);
         const size_t pos_S = hash_S & cachedView_S->htMask;
-        GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_S->ht[pos_S], hash_S)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
+        GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_S->ht[pos_S], hash_S, bloomMasksMy)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
         while(current_S){ 
             prefetch_l1(&current_S->next);
             if (current_S->hashValue == hash_S && current_S->key == lo_key_S) { // STALLS!
                 ////// PROBE C JOIN CONDITION //////
-                const int lo_key_C = lo_custkey[probeColTupleIdx];
+                const int lo_key_C = uncachedReadCS(&lo_custkey[probeColTupleIdx]);
                 const uint64_t hash_C = hashInt32ToInt64(lo_key_C);
                 const size_t pos_C = hash_C & cachedView_C->htMask;
-                current_C = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_C->ht[pos_C], hash_C)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
+                current_C = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_C->ht[pos_C], hash_C, bloomMasksMy)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
                 while(current_C){ 
-                    prefetch_l1(&current_C->next);
+                    // prefetch_l1(&current_C->next);
                     if (current_C->hashValue == hash_C && current_C->key == lo_key_C) {
                         ////// PROBE P JOIN CONDITION //////
-                        const int lo_key_P = lo_partkey[probeColTupleIdx];
+                        const int lo_key_P = uncachedReadCS(&lo_partkey[probeColTupleIdx]);
                         const uint64_t hash_P = hashInt32ToInt64(lo_key_P);
                         const size_t pos_P = hash_P & cachedView_P->htMask;
-                        GrowingBufEntryScan* current_P = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_P->ht[pos_P], hash_P));
+                        GrowingBufEntryScan* current_P = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_P->ht[pos_P], hash_P, bloomMasksMy));
                         while(current_P){
                             if (current_P->hashValue == hash_P && current_P->key == lo_key_P) {
                                 ////// PROBE D JOIN CONDITION //////
-                                const int lo_key_D = lo_orderdate[probeColTupleIdx];
+                                const int lo_key_D = uncachedReadCS(&lo_orderdate[probeColTupleIdx]);
                                 const uint64_t hash_D = hashInt32ToInt64(lo_key_D);
                                 const size_t pos_D = hash_D & cachedView_D->htMask;
-                                current_D = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_D->ht[pos_D], hash_D));
+                                current_D = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_D->ht[pos_D], hash_D, bloomMasksMy));
                                 while(current_D){
                                     if(current_D->hashValue == hash_D && current_D->key == lo_key_D){
                                         foundMatch = true;
                                     }
                                     if(foundMatch){break;}
-                                    current_D = filterTagged(current_D->next, hash_D);
+                                    current_D = filterTagged(current_D->next, hash_D, bloomMasksMy);
                                 }
                             }
                             if(foundMatch){break;}
-                            current_P = filterTagged(current_P->next, hash_P);
+                            current_P = filterTagged(current_P->next, hash_P, bloomMasksMy);
                         } 
                     }
                     if(foundMatch){break;}
-                    current_C = filterTagged(current_C->next, hash_C);
+                    current_C = filterTagged(current_C->next, hash_C, bloomMasksMy);
                 }
             }
             if(foundMatch){break;}
-            current_S = filterTagged(current_S->next, hash_S);
+            current_S = filterTagged(current_S->next, hash_S, bloomMasksMy);
         }
         ////// [END] PROBE JOIN CONDITIONS //////
         }
@@ -526,7 +538,7 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         }
         int mask = __ballot_sync(0xFFFFFFFF, foundMatch && needInsert);
         if(foundMatch){
-            int64_t value = lo_revenue[probeColTupleIdx] - lo_supplycost[probeColTupleIdx];
+            int64_t value = uncachedReadCS(&lo_revenue[probeColTupleIdx]) - uncachedReadCS(&lo_supplycost[probeColTupleIdx]);
             if(needInsert){
                 GrowingBufEntryResHT* myEntry = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->insertWarpOpportunistic(hashGroupCols, mask));
                 myEntry->hashValue = hashGroupCols;
@@ -701,7 +713,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         std::cout << "** BUILT HASH VIEWS **" << std::endl;
         std::cout << "** BUILDING PREAGGREGATION FRAGMENTS **" << std::endl;
         const size_t numFragments = 30;
-        const size_t numThreadsInBlockPreAggr = 640;
+        const size_t numThreadsInBlockPreAggr = 1024;
         PreAggregationHashtableFragmentSMEM* fragments_d;
         PreAggregationHashtableFragmentSMEM* fragments_h;
         CHECK_CUDA_ERROR(cudaMallocHost(&fragments_h, numFragments * sizeof(PreAggregationHashtableFragmentSMEM)));
@@ -744,7 +756,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
 
         INITPreAggregationHashtableFragmentsSingleThread<<<1,1>>>(d_result_preAggrHT, d_preAllocatedPartitions);
         mergePreAggregationHashtableFragments<<<64,512>>>(d_result_preAggrHT, d_preAllocatedPartitions, fragments_d, numFragments);
-        printPreAggregationHashtable<<<1,1>>>(d_result_preAggrHT, false);
+        // printPreAggregationHashtable<<<1,1>>>(d_result_preAggrHT, false);
         cudaDeviceSynchronize();
         CHECK_CUDA_ERROR(cudaGetLastError());
 
