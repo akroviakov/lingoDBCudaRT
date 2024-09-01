@@ -16,11 +16,11 @@ __device__ void release_lock(volatile int *lock){
 
 __device__ void acquireLock(int32_t* lock) {
     while (atomicCAS(lock, 0, 1) != 0);
-    __threadfence(); // lock may be cached in L1, there is a hazard of a lock update being visible only to L1 (i.e., one SM).
+    __threadfence(); // flush any global writes to L2 (globally visible). _block() flushes to L1/SMEM
 }
 
 __device__ void releaseLock(int32_t* lock) {
+    __threadfence(); // flush any global writes to L2 (globally visible)
     atomicExch(lock, 0); 
-    __threadfence(); // lock may be cached in L1, there is a hazard of a lock update being visible only to L1 (i.e., one SM).
 }
 #endif // LOCK_H

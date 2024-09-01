@@ -198,6 +198,7 @@ __global__ void fillGrowingBuffer(int** inputCols, int numCols, int numRows, int
         mergeWarpLocal<Level>(myBuffer, mergeToLeft);
     } 
 
+    __syncthreads();
     if (threadIdx.x == 0) {
         finalBuffer->getValuesPtr()->acqLock(); // "global" lock
         mergeToLeft(finalBuffer, myBuffer);
