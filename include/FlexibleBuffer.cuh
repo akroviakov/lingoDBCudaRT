@@ -6,13 +6,20 @@
 #include <cstdlib>
 #include <stdint.h>
 #include <stdio.h>
+#include <cuda/std/atomic>
 
+#include "lock.cuh"
 #ifdef GALLATIN_ENABLED
 // #include <gallatin/allocators/global_allocator.cuh>
 #include "/home/lax/TUM/Master/gallatin/include/gallatin/allocators/global_allocator.cuh"
 #endif
 
-__device__ __forceinline__ void* memAlloc(uint64_t numBytes){
+enum class COUNTER_NAME{MALLOC_BUF=0, MALLOC_VEC, FREE_BUF, FREE_VEC};
+constexpr int numCounters{4};
+__device__ int counterMalloc[numCounters];
+__device__ uint64_t totallyAllocated;
+
+__device__ __forceinline__ void* memAlloc(uint64_t numBytes, COUNTER_NAME source){
     void* result = nullptr;
     #ifdef GALLATIN_ENABLED
     result = gallatin::allocators::global_malloc(numBytes);
@@ -20,29 +27,31 @@ __device__ __forceinline__ void* memAlloc(uint64_t numBytes){
     result = malloc(numBytes);
     #endif
     // if(!result){
-    //     printf("[ERROR] memAlloc returned nullptr for %llu bytes alloc!\n", numBytes);
+    //     printf("[ERROR] memAlloc returned nullptr for %llu bytes alloc, already allocated %llu bytes!\n", numBytes, totallyAllocated);
     // }
+    atomicAdd(&counterMalloc[static_cast<int>(source)], 1);
     return result;
 }
 
-__device__ __forceinline__ void freePtr(void* ptr){
+__device__ __forceinline__ void freePtr(void* ptr, COUNTER_NAME source){
     #ifdef GALLATIN_ENABLED
     gallatin::allocators::global_free(ptr);
     #else
     free(ptr);
     #endif
+    atomicAdd(&counterMalloc[static_cast<int>(source)], 1);
 }
 
 struct Buffer {
     uint8_t* ptr;
-    uint32_t numElements{0};
+    int32_t numElements{0};
 };
 
 struct LeafBufferArray {
     // A single thread block won't create > 2^50 buffers
     static constexpr uint8_t capacity{50}; 
     Buffer staticPayLoad[capacity];
-    uint32_t size{0};
+    int32_t size{0};
     __device__ LeafBufferArray(){}
     __device__ void push_back(const Buffer& elem){
         staticPayLoad[size++] = elem;
@@ -52,7 +61,7 @@ struct LeafBufferArray {
         return staticPayLoad[size-1];
     }
 
-    __device__ __host__ Buffer& operator[](const uint32_t index) {
+    __device__ __host__ Buffer& operator[](const int32_t index) {
         return staticPayLoad[index];
     }
 };
@@ -60,35 +69,37 @@ struct LeafBufferArray {
 // "Leaf" means that it won't be merged into, no need for heap-based vector.
 class LeafFlexibleBuffer {
     LeafBufferArray buffers;
-    uint32_t typeSize;
-    uint32_t currCapacity;
-    uint32_t totalLen{0};
-    uint32_t lock{0};
+    int32_t typeSize;
+    int32_t currCapacity;
+    int32_t totalLen{0};
+    int32_t lock{0};
     __device__ uint8_t* allocCurrentCapacity() {
-        return reinterpret_cast<uint8_t*>(memAlloc(currCapacity * typeSize));
+        return reinterpret_cast<uint8_t*>(memAlloc(currCapacity * typeSize, COUNTER_NAME::MALLOC_BUF));
     }
 
     __device__ void nextBuffer() {
-        currCapacity *= 2;
+        if(currCapacity * typeSize < 32 * 1024 * 1024){ // Let's cut off at 32MB to prevent underutilization of large blocks
+            currCapacity *= 2;
+        }
         uint8_t* ptr = allocCurrentCapacity();
         buffers.push_back(Buffer{ptr, 0});
     }
     public:
-    __device__ LeafFlexibleBuffer(uint32_t initialCapacity, uint32_t typeSize, bool alloc = true) : currCapacity(initialCapacity), typeSize(typeSize) {
+    __device__ LeafFlexibleBuffer(int32_t initialCapacity, int32_t typeSize, bool alloc = true) : currCapacity(initialCapacity), typeSize(typeSize) {
         if (alloc) { // we can delay allocation until insertion
             uint8_t* ptr = allocCurrentCapacity();
             buffers.push_back(Buffer{ptr, 0});
         }
     }
-    __host__ __device__ uint32_t getLen() const { return totalLen; }
-    __host__ __device__ uint32_t getTypeSize() const { return typeSize; }
-    __host__ __device__ uint32_t getCurrCapacity() const { return currCapacity; }
+    __host__ __device__ int32_t getLen() const { return totalLen; }
+    __host__ __device__ int32_t getTypeSize() const { return typeSize; }
+    __host__ __device__ int32_t getCapacity() const { return currCapacity; }
     __host__ __device__ const LeafBufferArray* getBuffersPtr() const { return &buffers; }
     __host__ __device__ LeafBufferArray& getBuffers() { return buffers; }
-    __host__ __device__ void setLen(uint32_t newLen)  { totalLen = newLen; }
+    __host__ __device__ void setLen(int32_t newLen)  { totalLen = newLen; }
 
     __device__ uint8_t* insertWarpLevelOpportunistic(){
-        const int mask=__activemask();
+        const int mask{__activemask()};
         const int numWriters{__popc(mask)};
         const int leader{__ffs(mask)-1};
         uint8_t* res{nullptr};
@@ -107,7 +118,7 @@ class LeafFlexibleBuffer {
         return res;
     }
 
-    __device__ uint8_t* insert(const uint32_t numElems){
+    __device__ uint8_t* insert(const int32_t numElems){
         if (!buffers.size || buffers.back().numElements + numElems >= currCapacity) {
             nextBuffer();
         }
@@ -122,28 +133,35 @@ class LeafFlexibleBuffer {
 template<typename T>
 struct Vec {
     T* payLoad{nullptr};
-    uint32_t numElems{0};
-    uint32_t capacity{64};
+    int32_t numElems{0};
+    int32_t capacity{0};
 
     __device__ T* allocCurrentCapacity() {
-        return reinterpret_cast<T*>(memAlloc(capacity * sizeof(T)));
-    }
-
-    __device__ Vec() {}
-    __device__ ~Vec() {
-        if(payLoad){
-            freePtr(payLoad);
+        if(capacity == 0){
+            capacity = 64;
         }
+        atomicAdd((unsigned long long*)&totallyAllocated, capacity * sizeof(T));
+        return reinterpret_cast<T*>(memAlloc(capacity * sizeof(T), COUNTER_NAME::MALLOC_VEC));
     }
 
+    __device__ Vec() : payLoad(nullptr), numElems(0), capacity(0) {}
+    __device__ ~Vec() {} // should call destroy explicitly instead of relying on destructor!
+    __device__ void destroy(){
+        if(payLoad){
+            freePtr(payLoad, COUNTER_NAME::FREE_VEC);
+            payLoad = nullptr;
+        }
+        capacity = 0;
+        numElems = 0;
+    }
     __device__ void grow(){
         capacity *= 2;
         T* newPayLoad = allocCurrentCapacity();
-        if (payLoad != nullptr) {
-            for (uint32_t i = 0; i < numElems; ++i) {
+        if (payLoad) {
+            for (int32_t i = 0; i < numElems; i++) {
                 newPayLoad[i] = payLoad[i];
             }
-            freePtr(payLoad);
+            freePtr(payLoad, COUNTER_NAME::FREE_VEC);
         }
         payLoad = newPayLoad;
     }
@@ -156,22 +174,25 @@ struct Vec {
         numElems++;
     }
 
-    __device__ void merge(Vec<T>& other) {
-        for (uint32_t i = 0; i < other.size(); i++) {
-            if (other.payLoad) {
-                push_back(other.payLoad[i]); 
+    __device__ void merge(Vec<T>* other) {
+        if(!other->payLoad) {return;}
+        if(this == other) {return;}
+
+        if(payLoad){
+            for(int32_t i = 0; i < other->numElems; i++){
+                push_back(other->payLoad[i]);
             }
+        } else {
+            payLoad = other->payLoad;
+            other->payLoad = nullptr;
+            capacity = other->capacity;
+            numElems = other->numElems;
         }
-        other.numElems = 0;
-        other.capacity = 0;
-        if (other.payLoad) {
-            freePtr(other.payLoad);
-            other.payLoad = nullptr;
-        }
+        other->destroy();
     }
 
     __device__ void merge(LeafBufferArray& other){
-        for (uint32_t i = 0; i < other.size; i++) {
+        for (int32_t i = 0; i < other.size; i++) {
             if (other.staticPayLoad) {
                 push_back(other.staticPayLoad[i]); 
             }
@@ -179,62 +200,102 @@ struct Vec {
         other.size = 0;
     }
 
-    __device__ T& operator[](const uint32_t index) {
+    __device__ T& operator[](const int32_t index) {
         return payLoad[index];
     }
     __device__ T& back(){
         return payLoad[numElems-1];
     }
-    __device__ uint32_t size() const {
+    __device__ int32_t size() const {
         return numElems;
     }
 };
-
 class FlexibleBuffer {
     Vec<Buffer> buffers;
-    uint32_t totalLen{0};
-    uint32_t currCapacity{0};
-    uint32_t typeSize{0};
+    int32_t totalLen{0};
+    int32_t currCapacity{0};
+    int32_t typeSize{0};
+    int32_t lock{0};
 
     __device__ uint8_t* allocCurrentCapacity() {
-        return reinterpret_cast<uint8_t*>(memAlloc(currCapacity * typeSize));
+        atomicAdd((unsigned long long*)&totallyAllocated, currCapacity * typeSize);
+        return reinterpret_cast<uint8_t*>(memAlloc(currCapacity * typeSize, COUNTER_NAME::MALLOC_BUF));
     }
 
-    __device__ void nextBuffer(){
-        currCapacity *= 2;
+    __device__ void nextBuffer(int numElems){
+        while(currCapacity < numElems){ // Let's cut off at 4MB to prevent underutilization of large blocks
+            currCapacity *= 2;
+        }
+        if(currCapacity * typeSize < 4 * 1024 * 1024){
+            currCapacity *= 2;
+        }
+
         uint8_t* ptr = allocCurrentCapacity();
         buffers.push_back(Buffer{ptr, 0});
     }
 
 public:
-    uint32_t lock{0};
 
     __device__ FlexibleBuffer(){}
-    __device__ FlexibleBuffer(uint32_t initialCapacity, uint32_t typeSize, const Buffer& firstBuf) : totalLen(firstBuf.numElements), currCapacity(initialCapacity), typeSize(typeSize) {
+    __host__ __device__ FlexibleBuffer(int32_t typeSize) : typeSize(typeSize) {}
+    __device__ FlexibleBuffer(int32_t initialCapacity, int32_t typeSize, const Buffer& firstBuf) : totalLen(firstBuf.numElements), currCapacity(initialCapacity), typeSize(typeSize) {
         buffers.push_back(firstBuf);
     }
-    __device__ FlexibleBuffer(uint32_t initialCapacity, uint32_t typeSize, bool alloc = true) : currCapacity(initialCapacity), typeSize(typeSize) {
+    __device__ FlexibleBuffer(int32_t initialCapacity, int32_t typeSize, bool alloc = true) : currCapacity(initialCapacity), typeSize(typeSize) {
         if (alloc) {
             uint8_t* ptr = allocCurrentCapacity();
             buffers.push_back(Buffer{ptr, 0});
         }
     }
 
-    __device__ void destroy() {
-        for (uint32_t i = 0; i < buffers.size(); ++i) {
+    __device__ void destroy() { // At most one thread block!
+        for (int32_t i = threadIdx.x; i < buffers.size(); i+=blockDim.x) {
             if (buffers[i].ptr) {
-                freePtr(buffers[i].ptr);
+                freePtr(buffers[i].ptr, COUNTER_NAME::FREE_BUF);
             }
+        }
+        __syncthreads();
+        if(threadIdx.x == 0){
+            buffers.destroy();
         }
     }
 
-    __device__ ~FlexibleBuffer() {
-        destroy();
+    __device__ ~FlexibleBuffer() {}
+
+    __device__ void acqLock(){
+        acquireLock(&lock);
+    }    
+
+    __device__ void relLock(){
+        releaseLock(&lock);
     }
 
-    __device__ uint8_t* insert(const uint32_t numElems){
+    __device__ uint8_t* insertWarpLevelOpportunistic(){
+        const int mask{__activemask()};
+        const int numWriters{__popc(mask)};
+        const int leader{__ffs(mask)-1};
+        uint8_t* res{nullptr};
+        const int lane{threadIdx.x % warpSize};
+        if(lane == leader){
+            // A warp can diverge, so sub-warps will share the the warp-level data structure, ensure the lock is initialized.
+            acqLock();
+            res = insert(numWriters);
+            relLock();
+        }
+        
+        if(numWriters > 1){
+            res = reinterpret_cast<uint8_t*>(__shfl_sync(mask, (unsigned long long)res, leader));
+            const int laneOffset = __popc(mask & ((1U << lane) - 1));
+            res = &res[laneOffset * typeSize];
+        }
+        return res;
+    }
+
+    __device__ uint8_t* insert(const int32_t numElems){
+        // printf("buffers.size() = %d, buffers.back()= %p\n", buffers.size(),buffers.payLoad);
+
         if (buffers.size() == 0 || buffers.back().numElements + numElems >= currCapacity) {
-            nextBuffer();
+            nextBuffer(numElems);
         }
         uint8_t* res = &buffers.back().ptr[typeSize * (buffers.back().numElements)];
         buffers.back().numElements += numElems;
@@ -243,20 +304,23 @@ public:
     }
 
     __device__ void merge(FlexibleBuffer* other) {
-        buffers.merge(other->buffers);
-        totalLen += other->totalLen;
+        buffers.merge(&other->getBuffers());
+        currCapacity = max(currCapacity, other->getCapacity());
+        totalLen += other->getLen();
     }
 
     __device__ void merge(LeafFlexibleBuffer* other) {
         buffers.merge(other->getBuffers());
+        currCapacity = max(currCapacity, other->getCapacity());
         totalLen += other->getLen();
     }
 
-    __host__ __device__ uint32_t getLen() const { return totalLen;}
-    __host__ __device__ uint32_t buffersSize() { return buffers.numElems;}
-    __host__ __device__ uint32_t getTypeSize() const { return typeSize; }
+    __host__ __device__ int32_t getLen() const { return totalLen;}
+    __host__ __device__ int32_t buffersSize() { return buffers.numElems;}
+    __host__ __device__ int32_t getTypeSize() const { return typeSize; }
+    __host__ __device__ int32_t getCapacity() const { return currCapacity; }
     __host__ __device__ Vec<Buffer>& getBuffers() { return buffers; }
-    __host__ __device__ void lateInit(uint32_t newTypeSize, uint32_t newCapacity) {typeSize = newTypeSize; currCapacity = newCapacity; }
+    __host__ __device__ void lateInit(int32_t newTypeSize, int32_t newCapacity) {typeSize = newTypeSize; currCapacity = newCapacity; }
 
     __device__ void print(void (*printEntry)(uint8_t*) = nullptr){
         printf("--------------------FlexibleBuffer [%p]--------------------\n", this);
@@ -276,10 +340,10 @@ public:
 
 class FlexibleBufferIterator {
     FlexibleBuffer* parent;
-    uint32_t start{0};
-    uint32_t stride{0};
-    uint32_t bufferIndex{0};
-    uint32_t localIndex{0};
+    int32_t start{0};
+    int32_t stride{0};
+    int32_t bufferIndex{0};
+    int32_t localIndex{0};
 
     __device__ uint8_t* currentPointer() {
         if (bufferIndex < parent->getBuffers().size()) {
@@ -289,11 +353,11 @@ class FlexibleBufferIterator {
         }
     }
 public:
-    __device__ FlexibleBufferIterator(FlexibleBuffer* parent, uint32_t start, uint32_t stride) : parent(parent), start(start), stride(stride) {}
+    __device__ FlexibleBufferIterator(FlexibleBuffer* parent, int32_t start, int32_t stride) : parent(parent), start(start), stride(stride) {}
 
     __device__ uint8_t* initialize() { // Given start, find position across buffers
-        uint32_t numBuffers = parent->getBuffers().size();
-        uint32_t remaining = start;
+        int32_t numBuffers = parent->getBuffers().size();
+        int32_t remaining = start;
         for (bufferIndex = 0; bufferIndex < numBuffers; ++bufferIndex) {
             if (remaining < parent->getBuffers()[bufferIndex].numElements) {
                 localIndex = remaining;
@@ -305,7 +369,7 @@ public:
     }
 
     __device__ uint8_t* step() {
-        uint32_t numBuffers = parent->getBuffers().size();
+        int32_t numBuffers = parent->getBuffers().size();
         if (bufferIndex >= numBuffers) return nullptr;
         localIndex += stride;
         while (bufferIndex < numBuffers && localIndex >= parent->getBuffers()[bufferIndex].numElements) {
