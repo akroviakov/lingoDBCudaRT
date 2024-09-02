@@ -10,11 +10,13 @@
 #include <cstddef>
 #include <cstdint>
 
-class PreAggregationHashtableFragmentSMEM {
+class PreAggregationHashtableFragment {
     public:
-    static constexpr uint64_t numPartitions = 64;
-    static constexpr uint64_t partitionMask = numPartitions - 1;
     static constexpr uint64_t partitionShift = 6; //2^6=64
+    static constexpr uint64_t numPartitions = 1 << partitionShift;
+    static constexpr uint64_t partitionMask = numPartitions - 1;
+    static constexpr int initCapacity = 256;
+
     struct Entry {
         Entry* next;
         uint64_t hashValue;
@@ -23,38 +25,49 @@ class PreAggregationHashtableFragmentSMEM {
     };
     private:
     FlexibleBuffer partitions[numPartitions];
-    uint32_t len{0};
-    uint32_t typeSize;
+    int typeSize{0};
     public:
 
-    __device__ PreAggregationHashtableFragmentSMEM(uint32_t typeSize) : typeSize(typeSize){}  
-    __host__ __device__ __forceinline__ FlexibleBuffer* getPartitionPtr(uint32_t partitionID) {return &partitions[partitionID];} 
+    __host__ __device__ PreAggregationHashtableFragment(int typeSize) : typeSize(typeSize){
+        for (int i = 0; i < numPartitions; ++i) {
+            new(&partitions[i]) FlexibleBuffer(typeSize); 
+        }
+    }  
+    __host__ __device__ ~PreAggregationHashtableFragment(){}
 
-    __device__ __forceinline__ Entry* insertWarpOpportunistic(const uint64_t hash, const int maskInsert) {
-        const uint32_t partitionID = hash & partitionMask;
-        const int mask{__match_any_sync(maskInsert, partitionID)};
+    __host__ __device__ __forceinline__ FlexibleBuffer* getPartitionPtr(int partitionID) {return &partitions[partitionID];} 
+
+    __device__ __forceinline__ Entry* insertWarpOpportunistic(const uint64_t hash) {
+        const int partitionID = hash & partitionMask;
+        const int mask{__match_any_sync(__activemask(), partitionID)};
         const int numWriters{__popc(mask)};
         const int leader{__ffs(mask)-1};
-        const int lane{threadIdx.x % 32};
-
+        const int lane{threadIdx.x % warpSize};
+        FlexibleBuffer* targetPartition = &partitions[partitionID];
         Entry* newEntry{nullptr};
         if(lane == leader){
-            while(atomicExch(&partitions[partitionID].lock, 1u) == 1u){};
-            if(!partitions[partitionID].getTypeSize())
-                partitions[partitionID].lateInit(typeSize, 256);
-            newEntry = reinterpret_cast<Entry*>(partitions[partitionID].insert(numWriters));
-            atomicExch(&partitions[partitionID].lock, 0u); // release lock
+            targetPartition->acqLock();
+            newEntry = reinterpret_cast<Entry*>(targetPartition->insert(numWriters));
+            targetPartition->relLock();
         }
         if(numWriters > 1){
             const int laneOffset = __popc(mask & ((1U << lane) - 1));
             uint8_t* bytes = reinterpret_cast<uint8_t*>(__shfl_sync(mask, (unsigned long long)newEntry, leader)); // barrier stalls
             newEntry = reinterpret_cast<Entry*>(&bytes[laneOffset * typeSize]);
         }
-        // printf("[TID %d, output=%d] got ptr %p, numWriters=%d\n", threadIdx.x, outputPos, newEntry,numWriters);
         return newEntry;
     }
 
-    __device__ ~PreAggregationHashtableFragmentSMEM(){}
+    __device__ void append(PreAggregationHashtableFragment* other){
+        for(int i = 0; i < numPartitions; i++){
+            FlexibleBuffer* flexBufPtr = other->getPartitionPtr(i);
+            if(flexBufPtr->getLen()){
+                partitions[i].acqLock();
+                partitions[i].merge(flexBufPtr);
+                partitions[i].relLock();
+            }
+        }
+    }
 
     __device__ void print( void (*printEntry)(uint8_t*) = nullptr){
         printf("--------------------PreAggregationHashtableFragmentSMEM [%p]--------------------\n", this);
@@ -63,17 +76,14 @@ class PreAggregationHashtableFragmentSMEM {
         for(int i = 0; i < numPartitions; i++){
             countValidPartitions += (partitions[i].getTypeSize() != 0);
         }
-        printf("typeSize=%lu, len=%lu, %lu non-empty partitions out of %lu\n", typeSize, len, countValidPartitions, numPartitions);
+        printf("typeSize=%lu, %lu non-empty partitions out of %lu\n", typeSize, countValidPartitions, numPartitions);
         for(int i = 0; i < numPartitions; i++){
-            if(partitions[i].getTypeSize()){
+            if(partitions[i].getLen()){
                 printf("[Partition %d] ", i);
                 partitions[i].print(printEntry);
                 countFlexibleBufferLen += partitions[i].getLen();
                 printf("[END Partition %d] \n", i);
             }
-        }
-        if(countFlexibleBufferLen != len){
-            printf("[ERROR] aggregated FlexibleBuffer lengths (%lu) and Fragment's length (%lu)\n", countFlexibleBufferLen, len);
         }
         printf("---------------[END] PreAggregationHashtableFragmentSMEM [%p]--------------------\n", this);
     }
@@ -82,22 +92,19 @@ class PreAggregationHashtableFragmentSMEM {
 class PreAggregationHashtable {
     public:
 
-    using Entry=PreAggregationHashtableFragmentSMEM::Entry;
+    using Entry=PreAggregationHashtableFragment::Entry;
 
     struct PartitionHt{
         Entry** ht;
         size_t hashMask;
     };
-    PartitionHt ht[PreAggregationHashtableFragmentSMEM::numPartitions];
+    PartitionHt ht[PreAggregationHashtableFragment::numPartitions];
     FlexibleBuffer buffer;
-    volatile int mutex;
-    __device__ PreAggregationHashtable() : ht(), buffer(1, sizeof(PreAggregationHashtableFragmentSMEM::Entry*)) {
+    __device__ PreAggregationHashtable() : ht(), buffer(1, sizeof(PreAggregationHashtableFragment::Entry*)) {}
 
-    }
-
-    __device__ PreAggregationHashtable(PartitionHt* preAllocated) : buffer(1, sizeof(PreAggregationHashtableFragmentSMEM::Entry*)) {
+    __host__ __device__ PreAggregationHashtable(PartitionHt* preAllocated) : buffer(1, sizeof(PreAggregationHashtableFragment::Entry*)) {
         // printf("Preallocated [0]: ht=%p, hashMask=%lu\n", preAllocated[0].ht, preAllocated[0].hashMask);
-        memcpy(ht, preAllocated, sizeof(PartitionHt) * PreAggregationHashtableFragmentSMEM::numPartitions);
+        memcpy(ht, preAllocated, sizeof(PartitionHt) * PreAggregationHashtableFragment::numPartitions);
         // printf("ht [0]: ht=%p, hashMask=%lu\n", ht[0].ht, ht[0].hashMask);
     }
     __device__ __host__ static unsigned long long nextPow2(unsigned long long v) {
@@ -115,7 +122,7 @@ class PreAggregationHashtable {
     public:
     __device__ void print(){
         printf("--------------------PreAggregationHashtable [%p]--------------------\n", this);
-        for(int i = 0; i < PreAggregationHashtableFragmentSMEM::numPartitions; i++){
+        for(int i = 0; i < PreAggregationHashtableFragment::numPartitions; i++){
             printf("Partition %d: ht=%p, hashMask=%lu\n", i, ht[i].ht, ht[i].hashMask);
         }
         buffer.print();

@@ -7,12 +7,13 @@
 #include "PrefixSum.cuh"
 #include "helper.cuh"
 #include <cuda_runtime.h>
+#include <iostream>
 
 constexpr uint64_t KiB = 1024;
 constexpr uint64_t MiB = 1024 * KiB;
 constexpr uint64_t GiB = 1024 * MiB;
 constexpr uint64_t HEAP_SIZE{3*GiB};
-constexpr uint64_t NUM_RUNS = 40;
+constexpr uint64_t NUM_RUNS = 2;
 
 int sf=1;
 
@@ -94,8 +95,11 @@ __device__ void printEntryResHT(uint8_t* entryPtr){
     printf("{key_1=%d,key_2=%d,val=%lld,hash=%llu,next=%p},", structPtr->key[0], structPtr->key[1], structPtr->value, structPtr->hashValue, structPtr->next);
 }
 
-constexpr uint64_t TYPE_SIZE_SCAN{sizeof(GrowingBufEntryScan)}; // all columns scan one key and one val. If needed, specialize to TYPE_SIZE_SCAN_*COLNAME* 
-constexpr uint64_t TYPE_SIZE_RES_HT{sizeof(GrowingBufEntryResHT)};
+constexpr int32_t TYPE_SIZE_SCAN{sizeof(GrowingBufEntryScan)}; // all columns scan one key and one val. If needed, specialize to TYPE_SIZE_SCAN_*COLNAME* 
+constexpr int32_t TYPE_SIZE_RES_HT{sizeof(GrowingBufEntryResHT)};
+
+constexpr int64_t highestPowerOfTwo(int64_t n) { return n == 0 ? 0 : 1LL << (63 - __builtin_clzll(n));}
+constexpr uint8_t powerOfTwo(int64_t n, int power = 0) {return (n == 1) ? power : powerOfTwo(n / 2, power + 1);}
 
 std::pair<size_t, size_t> getHtSizeMask(size_t numElements, size_t elementSize){
     size_t size = max(PreAggregationHashtable::nextPow2(numElements * 1.25), 1ull);
@@ -118,22 +122,11 @@ __device__ __forceinline__ int64_t hashInt32ToInt64(int32_t x) {
     return static_cast<int64_t>(result);
 }
 
-__device__ __forceinline__ uint32_t hashInt32(int32_t key) {
-    key ^= key >> 16;
-    key *= 0x85ebca6b;
-    key ^= key >> 13;
-    key *= 0xc2b2ae35;
-    key ^= key >> 16;
-    return key;
-}
-
 __global__ void growingBufferInit(GrowingBuffer* finalBuffer) {
     if(blockDim.x * blockIdx.x + threadIdx.x == 0){
         new(finalBuffer) GrowingBuffer(INIT_CAPACITY, TYPE_SIZE_SCAN, false);
     }
 }
-
-__device__ volatile int GLOBAL_LOCK{0};
 
 enum class FillVariant{
     ThreadBlockLockStep = 1,
@@ -141,28 +134,26 @@ enum class FillVariant{
 };
 
 template<TABLE Table, FillVariant Impl = FillVariant::ThreadBlockLockStep>
-__global__ void growingBufferFillTB(int* filterCol, int* keyCol, int* valueCol, int numTuples, GrowingBuffer* finalBuffer) {
-    const int warp_count = (blockDim.x + (WARP_SIZE-1)) / WARP_SIZE;
+__global__ void growingBufferFillTB(int* filterCol, int* keyCol, int* valueCol, int numRows, GrowingBuffer* finalBuffer, GrowingBuffer* locals) {
+    const int laneId = threadIdx.x % warpSize;
+    const int globalTID = blockDim.x * blockIdx.x + threadIdx.x;
+    const int globalWarpID = globalTID / warpSize;
     const int numThreadsTotal = blockDim.x * gridDim.x;
-    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
-    const int lane = threadIdx.x % WARP_SIZE;
-    const int warpId = threadIdx.x / WARP_SIZE;
 
-    __shared__ char sharedMem[2048];
-    LeafFlexibleBuffer* myBuf = reinterpret_cast<LeafFlexibleBuffer*>(sharedMem);
-    GrowingBufEntryScan** writeCursor = reinterpret_cast<GrowingBufEntryScan**>(sharedMem + sizeof(LeafFlexibleBuffer));
-    uint32_t* counter = reinterpret_cast<uint32_t*>(sharedMem + sizeof(LeafFlexibleBuffer) + sizeof(GrowingBufEntryScan**));
+    __shared__ char tbCursorAndCounter[sizeof(GrowingBufEntryScan*) + sizeof(int)];
+    GrowingBufEntryScan** cursor = reinterpret_cast<GrowingBufEntryScan**>(tbCursorAndCounter);
+    int* counter = reinterpret_cast<int*>(&tbCursorAndCounter[sizeof(GrowingBufEntryScan*)]);
 
+    GrowingBuffer* myBuffer = &locals[blockIdx.x];
     if (threadIdx.x == 0) {
-        new (myBuf) LeafFlexibleBuffer(INIT_CAPACITY, TYPE_SIZE_SCAN, false);
+        new(myBuffer) GrowingBuffer(min(256 * 4 * 2, max(8,nearestPowerOfTwo(numRows / gridDim.x))), TYPE_SIZE_SCAN);
         *counter = 0;
     }
     __syncthreads();
-    uint32_t myIdx = 0;
-
-    int roundedSize = ((numTuples + (WARP_SIZE-1)) / WARP_SIZE) * WARP_SIZE;
-    for (int i = globalTid; i < roundedSize; i += numThreadsTotal) {
-        bool pred = (i < numTuples);
+    int myIdx = 0;
+    int numRowsRounded = ((numRows + (warpSize-1)) / warpSize) * warpSize;
+    for (int i = globalTID; i < numRowsRounded; i += numThreadsTotal) {
+        int pred = i < numRows;
         if(pred){
             if constexpr(Table == TABLE::S){
                 pred &= (filterCol[i] == 1);
@@ -177,14 +168,14 @@ __global__ void growingBufferFillTB(int* filterCol, int* keyCol, int* valueCol, 
         if constexpr(Impl == FillVariant::ThreadBlockLockStep){
             const int maskWriters = __ballot_sync(__activemask(), pred);
             const int leader = __ffs(maskWriters)-1;
-            if(lane == leader){
+            if(laneId == leader){
                 // _block ensures memory ordering only for this thread block (a more relaxed atomic)
-                myIdx = atomicAdd_block(counter, __popc(maskWriters)); // Shared load, heavy inst
+                myIdx = atomicAdd_block(counter, __popc(maskWriters));
             }
-            myIdx = __shfl_sync(maskWriters, myIdx, leader) + __popc(maskWriters & ((1U << lane) - 1)); // barrier stalls
+            myIdx = __shfl_sync(maskWriters, myIdx, leader) + __popc(maskWriters & ((1U << laneId) - 1)); // barrier stalls
             __syncthreads();
-            if (threadIdx.x == 0) { // Critical section, try to reduce time (e.g., put myBuf in SMEM).
-                *writeCursor = (GrowingBufEntryScan*)myBuf->insert(*counter);
+            if (threadIdx.x == 0) {
+                *cursor = (GrowingBufEntryScan*)myBuffer->insert(*counter);
                 *counter = 0;
             }
             __syncthreads();
@@ -192,9 +183,9 @@ __global__ void growingBufferFillTB(int* filterCol, int* keyCol, int* valueCol, 
         GrowingBufEntryScan* writeTo;
         if (pred) { // Uncoalesced stores
             if constexpr(Impl == FillVariant::ThreadBlockLockStep){
-                writeTo = *writeCursor; // Shared load
+                writeTo = *cursor; // Shared load
             } else {
-                writeTo = (GrowingBufEntryScan*)myBuf->insertWarpLevelOpportunistic(); // Shared load
+                writeTo = (GrowingBufEntryScan*)myBuffer->getValuesPtr()->insertWarpLevelOpportunistic(); // Shared load
             }
             writeTo[myIdx].key /*[0], [1] for many keys*/ = keyCol[i]; // Global 2 loads, 1 store (LG throttle: L2 can't keep up)
             writeTo[myIdx].hashValue = hashInt32ToInt64(keyCol[i]); // Global store
@@ -207,326 +198,138 @@ __global__ void growingBufferFillTB(int* filterCol, int* keyCol, int* valueCol, 
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        while (atomicCAS(&finalBuffer->getValuesPtr()->lock, 0, 1) != 0);
-        finalBuffer->getValuesPtr()->merge(myBuf);
-        atomicExch(&finalBuffer->getValuesPtr()->lock, 0);
+        finalBuffer->getValuesPtr()->acqLock(); // "global" lock
+        if(myBuffer->getLen()){
+            finalBuffer->getValuesPtr()->merge(myBuffer->getValuesPtr());
+        }
+        finalBuffer->getValuesPtr()->relLock();
     }
     // if(!threadIdx.x){finalBuffer->getValues().print(printEntryScan);}  // only for <<<1,X>>> debug
 }
 
-enum class HashIndexedViewBuilderType{
-    BufferToSM = 1,
-    BufferToGPU = 2
-};
-
-struct ViewCachedSubchain{
-    HashIndexedView::Entry* head{nullptr};
-    HashIndexedView::Entry* tail{nullptr};
-    int64_t writeOutPos{-1}; 
-};
-__device__ void atomicAppendSubList(HashIndexedView::Entry** globalHt, const size_t pos, HashIndexedView::Entry* subListHead, HashIndexedView::Entry* subListTail) {
-    HashIndexedView::Entry* currentHead = globalHt[pos];
-    HashIndexedView::Entry* old = currentHead;
-    const uint64_t hash = subListHead->hashValue; // global load
-    do {
-        currentHead = old;
-        if(subListHead != subListTail){ // We set tail to head on the first write to head, if they do not match -> sub-list length > 1, need to adjust tail
-            subListTail->next = currentHead; 
-        } else // if subListHead is not different from tail -> sub-list length 1, only adjust head
-            subListHead->next = currentHead; 
-        subListHead = tag(subListHead, currentHead, hash);
-        old = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[pos], (unsigned long long)currentHead, (unsigned long long)subListHead);
-    } while (old != currentHead);
-}
-
-__device__ __forceinline__ void atomicAppendSMEM(ViewCachedSubchain* ht, const size_t pos, HashIndexedView::Entry* newNode) {
-    HashIndexedView::Entry* currentHead = ht[pos].head; // shared load
-    HashIndexedView::Entry* old = currentHead;
-    const uint64_t hash = newNode->hashValue; // global load (scoreboard stalls)
-    do {
-        currentHead = old;
-        newNode->next = currentHead;  // global store
-        newNode = tag(newNode, currentHead, hash);
-        old = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&ht[pos].head, (unsigned long long)currentHead, (unsigned long long)newNode);
-    } while (old != currentHead);
-    if(!old) { // We executed the first write (meaning head was nullptr before): set tail to head. No other write to this head would update it anymore -> thread safe.
-        ht[pos].tail = newNode;
-    }
-}
-
-__device__ __forceinline__ void atomicAppend(HashIndexedView::Entry** globalHt, const size_t pos, HashIndexedView::Entry* newNode) {
-    HashIndexedView::Entry* currentHead = globalHt[pos]; // global load (scoreboard stalls) inefficient memory access patterns 
-    HashIndexedView::Entry* old = currentHead; 
-    const uint64_t hash = newNode->hashValue; // global load (scoreboard stalls) inefficient memory access patterns 
-    do {
-        currentHead = old;
-        newNode->next = currentHead; // global store (L2 throttle) inefficient memory access patterns 
-        newNode = tag(newNode, currentHead, hash);
-        old = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[pos], (unsigned long long)currentHead, (unsigned long long)newNode);
-    } while (old != currentHead); // takes many instructions (but few stalls)
-}
-
-template<HashIndexedViewBuilderType Qimpl = HashIndexedViewBuilderType::BufferToSM>
-__global__ void buildHashIndexedViewAdvancedSMEM(GrowingBuffer* buffer, HashIndexedView* view) {
-    const int warpCount = (blockDim.x + (WARP_SIZE-1)) / WARP_SIZE;
-    const int warpId = threadIdx.x / WARP_SIZE;
-    const int warpLane = threadIdx.x % WARP_SIZE;
+__global__ void buildHashIndexedViewSimple(GrowingBuffer* buffer, HashIndexedView* view) {
+    const int globalTID = blockDim.x * blockIdx.x + threadIdx.x;
     const int numThreadsTotal = blockDim.x * gridDim.x;
-    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
-
-    const int powerTwoTemp{10};
-    const size_t scracthPadMask{(1 << powerTwoTemp) - 1};
-    __shared__ ViewCachedSubchain scracthPad[1 << powerTwoTemp];
-
-    for(int i = threadIdx.x; i < scracthPadMask+1; i+=blockDim.x){
-        scracthPad[i].writeOutPos = -1ll;
-        scracthPad[i].head = nullptr;
-        scracthPad[i].tail = nullptr;
-    }
-    __syncthreads();
-
-    auto* values = buffer->getValuesPtr();
-    int bufferIdxStart{0};
-    int bufferIdxStep{0};
-    int bufferEntryIdxStart{0};
-    int bufferEntryIdxStep{0};
-    if constexpr(Qimpl == HashIndexedViewBuilderType::BufferToSM){
-        bufferIdxStart = blockIdx.x;
-        bufferIdxStep = gridDim.x;
-        bufferEntryIdxStart = threadIdx.x;
-        bufferEntryIdxStep = blockDim.x;
-    }
-    else{
-        bufferIdxStart = 0;
-        bufferIdxStep = 1;
-        bufferEntryIdxStart = globalTid;
-        bufferEntryIdxStep = numThreadsTotal;
-    }
-    // int conflictCnt{0};
-    const int buffersCnt{values->getBuffers().size()}; // Global load 
-    const size_t globalMask{view->htMask}; // Global load 
-    HashIndexedView::Entry** globalHt{view->ht}; // Global load 
-
-
-    // Iterator
-    FlexibleBufferIterator myIterator(buffer->getValuesPtr(), globalTid, numThreadsTotal);
+    const uint64_t globalMask{view->htMask}; 
+    HashIndexedView::Entry** globalHt{view->ht};
+    FlexibleBufferIterator myIterator(buffer->getValuesPtr(), globalTID, numThreadsTotal);
     HashIndexedView::Entry* entry = (HashIndexedView::Entry*)myIterator.initialize();
     while(entry){
-        size_t hash = (size_t) entry->hashValue; // Global load (heavy)
-        const size_t posGlobal = hash & globalMask;
+        uint64_t hash = (uint64_t) entry->hashValue;
+        const uint64_t pos = hash & globalMask;
         HashIndexedView::Entry* newEntry;
         HashIndexedView::Entry* current;
         HashIndexedView::Entry* exchanged;
+        // Try to put entry to the head of the linked list at globalHt[pos]. 
+        // Success iff while preparing the entry to point to head, the head didn't change.
         do {
-            current=globalHt[posGlobal];
-            entry->next=current;
-            newEntry = tag(entry, current, hash);
-            exchanged = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[posGlobal], (unsigned long long)current, (unsigned long long)newEntry);
-        } while (exchanged!=current);
+            current = globalHt[pos]; // read head (TODO: do we need to read globalHt[pos] or can we reuse exchanged?)
+            entry->next = current; // entry point to head
+            newEntry = tag(entry, current, hash); // update bloom filter aggregate
+            exchanged = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[pos], (unsigned long long)current, (unsigned long long)newEntry);
+        } while (exchanged != current); // retry if the head changed, otherwise the atomic write did happen and we exit.
         entry = (HashIndexedView::Entry*)myIterator.step();
     }
-
-    // Buffer-to-X 
-    // for(int bufIdx=bufferIdxStart; bufIdx<buffersCnt; bufIdx+=bufferIdxStep){  
-    //     auto* buffer = &values->getBuffers()[bufIdx];
-    //     const int entryCnt{buffer->numElements}; // Global load 
-    //     for (int bufEntryIdx = bufferEntryIdxStart; bufEntryIdx < entryCnt; bufEntryIdx+=bufferEntryIdxStep) { 
-    //         HashIndexedView::Entry* entry = (HashIndexedView::Entry*) &buffer->ptr[bufEntryIdx * TYPE_SIZE_SCAN]; // if needed, specialize TYPE_SIZE_SCAN
-    //         size_t hash = (size_t) entry->hashValue; // Global load (heavy)
-    //         const size_t posGlobal = hash & globalMask;
-    //         HashIndexedView::Entry* newEntry;
-    //         HashIndexedView::Entry* current;
-    //         HashIndexedView::Entry* exchanged;
-    //         do {
-    //             current=globalHt[posGlobal];
-    //             entry->next=current;
-    //             newEntry = tag(entry, current, hash);
-    //             exchanged = (HashIndexedView::Entry*) atomicCAS((unsigned long long*)&globalHt[posGlobal], (unsigned long long)current, (unsigned long long)newEntry);
-    //         } while (exchanged!=current);
-    //     }
-    // }
-    // __syncthreads();
-    // for(int i = threadIdx.x; i < scracthPadMask+1; i+=blockDim.x){
-    //     if(scracthPad[i].head){
-    //         atomicAppendSubList(view->ht, scracthPad[i].writeOutPos, scracthPad[i].head, scracthPad[i].tail);
-    //     }
-    // }
     // if(!threadIdx.x){view->print();}  // only for <<<1,X>>> debug
 }
 
-struct ViewResult{
-    GrowingBuffer* h_filter_scan{nullptr};
-    GrowingBuffer* d_filter_scan{nullptr}; 
-    HashIndexedView* h_hash_view{nullptr}; 
-    HashIndexedView* d_hash_view{nullptr};
-};
-
-template<TABLE Table>
-ViewResult buildView(int* filterCol, int* keyCol, int* valCol, int numTuples){
-    ViewResult res;
-    CHECK_CUDA_ERROR(cudaMallocHost(&res.h_filter_scan, sizeof(GrowingBuffer)));
-    CHECK_CUDA_ERROR(cudaMalloc(&res.d_filter_scan, sizeof(GrowingBuffer)));
-    CHECK_CUDA_ERROR(cudaMallocHost(&res.h_hash_view, sizeof(HashIndexedView)));
-    CHECK_CUDA_ERROR(cudaMalloc(&res.d_hash_view, sizeof(HashIndexedView)));
-    
-    growingBufferInit<<<1,1>>>(res.d_filter_scan);
-    // If you execute __syncthreads() to synchronize the threads of a block, it is recommended to have more than the achieved 1 blocks per multiprocessor. 
-    // This way, blocks that aren't waiting for __syncthreads() can keep the hardware busy
-    growingBufferFillTB<Table><<<30,512>>>(filterCol, keyCol, valCol, numTuples, res.d_filter_scan); 
-    cudaDeviceSynchronize();
-    CHECK_CUDA_ERROR(cudaGetLastError());
-
-
-    CHECK_CUDA_ERROR(cudaMemcpy(res.h_filter_scan, res.d_filter_scan, sizeof(GrowingBuffer), cudaMemcpyDeviceToHost));
-    auto [htAllocSize, htMask] = getHtSizeMask(res.h_filter_scan->getValuesPtr()->getLen(), sizeof(GrowingBufEntryScan*)); // if needed, specialize GrowingBufEntryScan*
-    std::cout << "Filter in: " << numTuples << ", filter out: " <<  res.h_filter_scan->getValuesPtr()->getLen() << "\n";
-    res.h_hash_view->htMask = htMask;
-    CHECK_CUDA_ERROR(cudaMalloc(&res.h_hash_view->ht, htAllocSize));
-    CHECK_CUDA_ERROR(cudaMemset(res.h_hash_view->ht, 0, htAllocSize));
-    CHECK_CUDA_ERROR(cudaMemcpy(res.d_hash_view, res.h_hash_view, sizeof(HashIndexedView), cudaMemcpyHostToDevice));
-    
-    buildHashIndexedViewAdvancedSMEM<HashIndexedViewBuilderType::BufferToGPU><<<30,256>>>(res.d_filter_scan, res.d_hash_view);
-    cudaDeviceSynchronize();
-    CHECK_CUDA_ERROR(cudaGetLastError());
-
-    return res;
-}
-
-__device__ __forceinline__ int uncachedReadCS(int* ptr) {
-    int value;
-    asm volatile("ld.cs.b32 %0, [%1];" : "=r"(value) : "l"(ptr));
-    return value;
-}
-
-__device__ __forceinline__ void prefetch_l2(const void *p) {asm("prefetch.global.L2 [%0];" : : "l"(p));}
-__device__ __forceinline__ void prefetch_l1(const void *p) {asm("prefetch.global.L1 [%0];" : : "l"(p));}
-constexpr int64_t highestPowerOfTwo(int64_t n) { return n == 0 ? 0 : 1LL << (63 - __builtin_clzll(n));}
-constexpr uint8_t powerOfTwo(int64_t n, int power = 0) {return (n == 1) ? power : powerOfTwo(n / 2, power + 1);}
-constexpr int64_t SMEM_SIZE{36 * KiB};
-static constexpr int64_t freeSMEM{SMEM_SIZE - (sizeof(PreAggregationHashtableFragmentSMEM) + 4*sizeof(HashIndexedView))}; 
-static constexpr uint8_t scracthPadShift{powerOfTwo(highestPowerOfTwo(freeSMEM)/sizeof(PreAggregationHashtableFragmentSMEM::Entry*))};
-static constexpr uint64_t scracthPadSize{1 << scracthPadShift};
-static constexpr uint64_t scracthPadMask{scracthPadSize-1};
-__global__ void buildPreAggregationHashtableFragmentsAdvanced(
+__global__ void buildPreAggregationHashtableFragments(
         int* lo_orderdate, int* lo_partkey, int* lo_custkey, int* lo_suppkey, int* lo_revenue, int* lo_supplycost, int lo_len,
-        HashIndexedView* sView, HashIndexedView* cView, HashIndexedView* pView, HashIndexedView* dView, 
-        PreAggregationHashtableFragmentSMEM* fragments) 
-    {
-    //  1024 threads per block, the maximum registers per thread is 64
-    const int warpCount = (blockDim.x + (WARP_SIZE-1)) / WARP_SIZE;
-    const int warpId = threadIdx.x / WARP_SIZE;
-    const int warpLane = threadIdx.x % WARP_SIZE;
+        HashIndexedView* sView, HashIndexedView* cView, HashIndexedView* pView, HashIndexedView* dView,  int scratchPadPow2,
+        PreAggregationHashtableFragment* globalFrag, PreAggregationHashtableFragment* locals) 
+{
+    const int laneId = threadIdx.x % warpSize;
+    const int globalTID = blockDim.x * blockIdx.x + threadIdx.x;
+    const int globalWarpID = globalTID / warpSize;
     const int numThreadsTotal = blockDim.x * gridDim.x;
-    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
-    const int globalWarpID = globalTid / WARP_SIZE;
+    extern __shared__ char smem[];
+    const uint64_t scratchPadSize{(1 << scratchPadPow2) / sizeof(PreAggregationHashtableFragment::Entry**)};
+    const uint64_t scratchPadMask{scratchPadSize-1};
 
-    __shared__ char smem[
-        scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) 
-        + 4*sizeof(HashIndexedView) 
-        + sizeof(PreAggregationHashtableFragmentSMEM)
-        + sizeof(uint16_t) * 2048];
-    PreAggregationHashtableFragmentSMEM::Entry** scracthPad = reinterpret_cast<PreAggregationHashtableFragmentSMEM::Entry**>(smem);
-    HashIndexedView* cachedView_S = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*));
-    HashIndexedView* cachedView_P = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + sizeof(HashIndexedView));
-    HashIndexedView* cachedView_D = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 2*sizeof(HashIndexedView));
-    HashIndexedView* cachedView_C = reinterpret_cast<HashIndexedView*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 3*sizeof(HashIndexedView));
-    PreAggregationHashtableFragmentSMEM* myFrag = reinterpret_cast<PreAggregationHashtableFragmentSMEM*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 4*sizeof(HashIndexedView));
-    uint16_t* bloomMasksMyMask = reinterpret_cast<uint16_t*>(smem + scracthPadSize * sizeof(PreAggregationHashtableFragmentSMEM::Entry*) + 4*sizeof(HashIndexedView) + sizeof(PreAggregationHashtableFragmentSMEM));
-    for(int i = threadIdx.x; i < scracthPadSize; i+=blockDim.x){
+    // Scratchpad is used as "cache" to aggregate as much as possible until the first hash conflict.
+    PreAggregationHashtableFragment::Entry** scracthPad = reinterpret_cast<PreAggregationHashtableFragment::Entry**>(smem);
+    for(int i = threadIdx.x; i < scratchPadSize; i+=blockDim.x){
         scracthPad[i] = nullptr;
     }
-    for(int i = threadIdx.x; i < 2048; i+=blockDim.x){
-        bloomMasksMyMask[i] = bloomMasks[i];
-    }
-    const uint16_t* bloomMasksMy = bloomMasksMyMask;
+    // Each thread block has its own fragment
+    PreAggregationHashtableFragment* myFrag = &locals[blockIdx.x];
     if(threadIdx.x == 0){
-        *cachedView_S = *sView;
-        *cachedView_P = *pView;
-        *cachedView_D = *dView;
-        *cachedView_C = *cView;
-        new(myFrag) PreAggregationHashtableFragmentSMEM(TYPE_SIZE_RES_HT);
+        new(myFrag) PreAggregationHashtableFragment(TYPE_SIZE_RES_HT);
     }
     __syncthreads();
-    // iterate over probe cols
-    int probeColIdxStart = globalTid;
-    int probeColIdxStep = numThreadsTotal;
-    int roundedSize = ((lo_len + 31) / 32) * 32; 
-    for(int probeColTupleIdx = probeColIdxStart; probeColTupleIdx < roundedSize; probeColTupleIdx+=probeColIdxStep){
-        const bool remainInLoop{probeColTupleIdx < lo_len};
-        bool foundMatch{false}; // PROBING
+
+    const int numRowsRounded = ((lo_len + (warpSize-1)) / warpSize) * warpSize;
+    for(int probeColTupleIdx = globalTID; probeColTupleIdx < numRowsRounded; probeColTupleIdx+=numThreadsTotal){
+        int pred = probeColTupleIdx < lo_len;
+        int foundMatch{0}; // PROBING
         GrowingBufEntryScan* current_C{nullptr}; // value cols
         GrowingBufEntryScan* current_D{nullptr}; 
-        if(remainInLoop){
-        // prefetch_l1(&lo_suppkey[probeColTupleIdx + probeColIdxStep]);
-        // prefetch_l1(&lo_custkey[probeColTupleIdx + probeColIdxStep]);
-        // prefetch_l1(&lo_partkey[probeColTupleIdx + probeColIdxStep]);
-        // prefetch_l1(&lo_orderdate[probeColTupleIdx + probeColIdxStep]);
-        ////// PROBE S JOIN CONDITION //////
-        // __ldg - may get cached in the read-only data cache (not L1)
-        const int lo_key_S = uncachedReadCS(&lo_suppkey[probeColTupleIdx]);
-        const uint64_t hash_S = hashInt32ToInt64(lo_key_S);
-        const size_t pos_S = hash_S & cachedView_S->htMask;
-        GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_S->ht[pos_S], hash_S, bloomMasksMy)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
-        while(current_S){ 
-            prefetch_l1(&current_S->next);
-            if (current_S->hashValue == hash_S && current_S->key == lo_key_S) { // STALLS!
-                ////// PROBE C JOIN CONDITION //////
-                const int lo_key_C = uncachedReadCS(&lo_custkey[probeColTupleIdx]);
-                const uint64_t hash_C = hashInt32ToInt64(lo_key_C);
-                const size_t pos_C = hash_C & cachedView_C->htMask;
-                current_C = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_C->ht[pos_C], hash_C, bloomMasksMy)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
-                while(current_C){ 
-                    // prefetch_l1(&current_C->next);
-                    if (current_C->hashValue == hash_C && current_C->key == lo_key_C) {
-                        ////// PROBE P JOIN CONDITION //////
-                        const int lo_key_P = uncachedReadCS(&lo_partkey[probeColTupleIdx]);
-                        const uint64_t hash_P = hashInt32ToInt64(lo_key_P);
-                        const size_t pos_P = hash_P & cachedView_P->htMask;
-                        GrowingBufEntryScan* current_P = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_P->ht[pos_P], hash_P, bloomMasksMy));
-                        while(current_P){
-                            if (current_P->hashValue == hash_P && current_P->key == lo_key_P) {
-                                ////// PROBE D JOIN CONDITION //////
-                                const int lo_key_D = uncachedReadCS(&lo_orderdate[probeColTupleIdx]);
-                                const uint64_t hash_D = hashInt32ToInt64(lo_key_D);
-                                const size_t pos_D = hash_D & cachedView_D->htMask;
-                                current_D = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cachedView_D->ht[pos_D], hash_D, bloomMasksMy));
-                                while(current_D){
-                                    if(current_D->hashValue == hash_D && current_D->key == lo_key_D){
-                                        foundMatch = true;
+        ////// PROBE JOIN CONDITIONS //////
+        if(pred){ 
+            ////// PROBE S JOIN CONDITION //////
+            const int lo_key_S = lo_suppkey[probeColTupleIdx];
+            const uint64_t hash_S = hashInt32ToInt64(lo_key_S);
+            const size_t pos_S = hash_S & sView->htMask;
+            GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(sView->ht[pos_S], hash_S, bloomMasks)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
+            while(current_S){ 
+                if (current_S->hashValue == hash_S && current_S->key == lo_key_S) { // STALLS!
+                    ////// PROBE C JOIN CONDITION //////
+                    const int lo_key_C = lo_custkey[probeColTupleIdx];
+                    const uint64_t hash_C = hashInt32ToInt64(lo_key_C);
+                    const size_t pos_C = hash_C & cView->htMask;
+                    current_C = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cView->ht[pos_C], hash_C, bloomMasks)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
+                    while(current_C){ 
+                        if (current_C->hashValue == hash_C && current_C->key == lo_key_C) {
+                            ////// PROBE P JOIN CONDITION //////
+                            const int lo_key_P = lo_partkey[probeColTupleIdx];
+                            const uint64_t hash_P = hashInt32ToInt64(lo_key_P);
+                            const size_t pos_P = hash_P & pView->htMask;
+                            GrowingBufEntryScan* current_P = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(pView->ht[pos_P], hash_P, bloomMasks));
+                            while(current_P){
+                                if (current_P->hashValue == hash_P && current_P->key == lo_key_P) {
+                                    ////// PROBE D JOIN CONDITION //////
+                                    const int lo_key_D = lo_orderdate[probeColTupleIdx];
+                                    const uint64_t hash_D = hashInt32ToInt64(lo_key_D);
+                                    const size_t pos_D = hash_D & dView->htMask;
+                                    current_D = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(dView->ht[pos_D], hash_D, bloomMasks));
+                                    while(current_D){
+                                        if(current_D->hashValue == hash_D && current_D->key == lo_key_D){
+                                            foundMatch = true;
+                                        }
+                                        if(foundMatch){break;}
+                                        current_D = filterTagged(current_D->next, hash_D, bloomMasks);
                                     }
-                                    if(foundMatch){break;}
-                                    current_D = filterTagged(current_D->next, hash_D, bloomMasksMy);
                                 }
-                            }
-                            if(foundMatch){break;}
-                            current_P = filterTagged(current_P->next, hash_P, bloomMasksMy);
-                        } 
+                                if(foundMatch){break;}
+                                current_P = filterTagged(current_P->next, hash_P, bloomMasks);
+                            } 
+                        }
+                        if(foundMatch){break;}
+                        current_C = filterTagged(current_C->next, hash_C, bloomMasks);
                     }
-                    if(foundMatch){break;}
-                    current_C = filterTagged(current_C->next, hash_C, bloomMasksMy);
                 }
+                if(foundMatch){break;}
+                current_S = filterTagged(current_S->next, hash_S, bloomMasks);
             }
-            if(foundMatch){break;}
-            current_S = filterTagged(current_S->next, hash_S, bloomMasksMy);
-        }
-        ////// [END] PROBE JOIN CONDITIONS //////
-        }
+        }  ////// [END] PROBE JOIN CONDITIONS //////
 
         ////// INSERT/UPDATE PARTIAL AGGREGATE //////
         bool needInsert{false};
         int64_t hashGroupCols{-1};
-        int scracthPadPos{-1};
+        int scratchPadPos{-1};
         GrowingBufEntryResHT* partialAggEntry = nullptr;
         if(foundMatch){
-            hashGroupCols = combineHashes(hashInt32ToInt64(current_D->value), hashInt32ToInt64(current_C->value));
-            scracthPadPos = (hashGroupCols >> scracthPadShift) & scracthPadMask;
-            partialAggEntry = reinterpret_cast<GrowingBufEntryResHT*>(scracthPad[scracthPadPos]);
+            int val_D = current_D->value;
+            int val_C = current_C->value;
+            hashGroupCols = combineHashes(hashInt32ToInt64(val_D), hashInt32ToInt64(val_C));
+            scratchPadPos = (hashGroupCols >> scratchPadPow2) & scratchPadMask;
+            partialAggEntry = reinterpret_cast<GrowingBufEntryResHT*>(scracthPad[scratchPadPos]);
             if(!partialAggEntry){ 
                 needInsert = true; // if no entry found (nullptr) at position
             } else {
                 if(partialAggEntry->hashValue == hashGroupCols){ // Global load (stalls)
                     // Q4.1. returns select d_year,c_nation,sum(lo_revenue-lo_supplycost) as profit 
-                    if(partialAggEntry->key[0] == current_D->value && partialAggEntry->key[1] == current_C->value){
+                    if(partialAggEntry->key[0] == val_D && partialAggEntry->key[1] == val_C){
                         needInsert = false; // if found entry, hash and key match
                     } else { 
                         needInsert = true; // if key doesn't match, collision -> insert
@@ -536,21 +339,21 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
                 }
             }
         }
-        int mask = __ballot_sync(0xFFFFFFFF, foundMatch && needInsert);
+        // int mask = __ballot_sync(0xFFFFFFFF, foundMatch && needInsert);
         if(foundMatch){
             int64_t value = uncachedReadCS(&lo_revenue[probeColTupleIdx]) - uncachedReadCS(&lo_supplycost[probeColTupleIdx]);
             if(needInsert){
-                GrowingBufEntryResHT* myEntry = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->insertWarpOpportunistic(hashGroupCols, mask));
+                GrowingBufEntryResHT* myEntry = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->insertWarpOpportunistic(hashGroupCols));
                 myEntry->hashValue = hashGroupCols;
                 myEntry->key[0] = current_D->value;
                 myEntry->key[1] = current_C->value;
                 myEntry->value = value;
                 myEntry->next=nullptr;
-                atomicExch_block(reinterpret_cast<unsigned long long*>(&scracthPad[scracthPadPos]), (unsigned long long)myEntry);
+                atomicExch_block(reinterpret_cast<unsigned long long*>(&scracthPad[scratchPadPos]), (unsigned long long)myEntry);
             } else {
                 atomicAdd(reinterpret_cast<unsigned long long*>(&partialAggEntry->value), (long long)(value));
                 
-                // Complex values may be unable to use atomics -> lock
+                // Composite values may be unable to use atomics -> lock
                 // GrowingBufEntryResHT* next;
                 // do{
                 //     next = (GrowingBufEntryResHT*)atomicExch((unsigned long long*)&partialAggEntry->next, 1ull);
@@ -562,20 +365,17 @@ __global__ void buildPreAggregationHashtableFragmentsAdvanced(
         ////// [END] INSERT/UPDATE PARTIAL AGGREGATE //////
     }
     __syncthreads();
-    for(uint32_t i = threadIdx.x; i < sizeof(PreAggregationHashtableFragmentSMEM); i+=blockDim.x){ // cooperate on copy
-        char* myFragAsChar = reinterpret_cast<char*>(myFrag);
-        char* globalFragAsChar = reinterpret_cast<char*>(&fragments[blockIdx.x]);
-        globalFragAsChar[i] = myFragAsChar[i];
+    if(threadIdx.x==0){
+        globalFrag->append(myFrag);
     }
-    ///////////////////////////////////////////
-}  
+}
 
 __global__ void printPreAggregationHashtable(PreAggregationHashtable* ht, bool printEmpty=false) {
     printf("---------------------PreAggregationHashtable [%p]-------------------------\n", ht);
     int resCnt{0};
-    for(int p = 0; p < PreAggregationHashtableFragmentSMEM::numPartitions; p++){
+    for(int p = 0; p < PreAggregationHashtableFragment::numPartitions; p++){
         for(int i = 0; i < ht->ht[p].hashMask+1; i++){
-            GrowingBufEntryResHT* curr = reinterpret_cast<GrowingBufEntryResHT*>(ht->ht[p].ht[i]);
+            GrowingBufEntryResHT* curr = reinterpret_cast<GrowingBufEntryResHT*>(untag(ht->ht[p].ht[i]));
             if(!printEmpty && !curr){continue;}
             printf("[PARTITION %d, htEntryIdx=%d]", p, i);
             while(curr){
@@ -606,99 +406,99 @@ __device__ void combineInt(uint8_t* lhs, uint8_t* rhs){
     auto* rhsC = reinterpret_cast<GrowingBufEntryResHT*>(rhs);
     lhsC->value += rhsC->value;
 }
-__global__ void INITPreAggregationHashtableFragmentsSingleThread(PreAggregationHashtable* preAggrHT, PreAggregationHashtable::PartitionHt* preAllocatedPartitions){
-    if(blockDim.x * blockIdx.x + threadIdx.x == 0){
-        new(preAggrHT) PreAggregationHashtable(preAllocatedPartitions);
-    }
-}
-__global__ void mergePreAggregationHashtableFragments(
-        PreAggregationHashtable* preAggrHT, 
-        PreAggregationHashtable::PartitionHt* preAllocatedPartitions, 
-        PreAggregationHashtableFragmentSMEM* fragments, 
-        size_t numFrags) 
-    {
-    const int warpCount = (blockDim.x + (WARP_SIZE-1)) / WARP_SIZE;
-    const int warpId = threadIdx.x / WARP_SIZE;
-    const int warpLane = threadIdx.x % WARP_SIZE;
-    const int numThreadsTotal = blockDim.x * gridDim.x;
-    const int globalTid = blockDim.x * blockIdx.x + threadIdx.x;
 
-    int cntr{0};
-    /*
-        - Partitions: have hts that are mutually exclusive in terms of sync -> partition-to-SM
-        - Fragments: 
-    */
-    int partitionId = blockIdx.x % 64;
-    int partitionWorkerId = blockIdx.x / 64;
 
-    int blocks_per_partition = gridDim.x / 64;
-    int extra_blocks = gridDim.x % 64;
-    int stride = blocks_per_partition + (partitionId <= extra_blocks);
+__global__ void mergePreAggregationHashtableFragments(PreAggregationHashtable* preAggrHT, PreAggregationHashtableFragment* fragment) {
+    for(int partitionId = blockIdx.x; partitionId < PreAggregationHashtableFragment::numPartitions; partitionId+=gridDim.x){
+        PreAggregationHashtable::Entry** ht = preAggrHT->ht[partitionId].ht;
+        const uint64_t htMask = preAggrHT->ht[partitionId].hashMask;
+        FlexibleBuffer* fragmentPartitionBuffer = fragment->getPartitionPtr(partitionId);
+        FlexibleBufferIterator myIterator(fragmentPartitionBuffer, threadIdx.x, blockDim.x);
+        PreAggregationHashtable::Entry* candidate = (PreAggregationHashtable::Entry*)myIterator.initialize();
+        while(candidate){
+            const uint64_t pos = candidate->hashValue >> PreAggregationHashtableFragment::partitionShift & htMask;
+            PreAggregationHashtable::Entry* currHead;
+            do { // Take pos ownership: currHead is 0 -> empty pos, currHead is 1 -> somebody works on it, else -> valid pos.
+                currHead = reinterpret_cast<PreAggregationHashtable::Entry*>(atomicExch((unsigned long long*)&ht[pos], 1ull));
+            } while((unsigned long long)currHead == 1ull);
+            PreAggregationHashtable::Entry* currListNode = untag(currHead);
+            GrowingBufEntryResHT* candidatePtr = reinterpret_cast<GrowingBufEntryResHT*>(currListNode);
+            GrowingBufEntryResHT* currPtr = reinterpret_cast<GrowingBufEntryResHT*>(candidate); // cast to custom struct
 
-    PreAggregationHashtable::Entry** ht = preAggrHT->ht[partitionId].ht;
-    const size_t htMask = preAggrHT->ht[partitionId].hashMask;
-    // __syncthreads();
-    // printf("[MergePreAggr] numFrags=%lu\n", numFrags);
-    for(int fragmentId = 0; fragmentId < numFrags; fragmentId++){ 
-        FlexibleBuffer* fragmentPartitionBuffer = fragments[fragmentId].getPartitionPtr(partitionId);
-        // printf("[MergePreAggr][fragmentId=%d] fragmentPartitionBuffer=%p\n",fragmentId, fragmentPartitionBuffer);
-        if(!fragmentPartitionBuffer->getTypeSize()){continue;} // many stalls, long scoreboard
-        const int buffersCnt{fragmentPartitionBuffer->getBuffers().size()};
-        for(int bufferIdx = partitionWorkerId; bufferIdx < buffersCnt; bufferIdx+=stride){
-            Buffer* buf = &fragmentPartitionBuffer->getBuffers().payLoad[bufferIdx];
-            const int elemsCnt{buf->numElements};
-            for (int elementIdx = threadIdx.x; elementIdx < buf->numElements; elementIdx+=blockDim.x) {
-                PreAggregationHashtableFragmentSMEM::Entry* curr = reinterpret_cast<PreAggregationHashtableFragmentSMEM::Entry*>(&buf->ptr[elementIdx * TYPE_SIZE_RES_HT]); // Global load
-                const size_t pos = curr->hashValue >> PreAggregationHashtableFragmentSMEM::partitionShift & htMask; // Global load
-                
-                // printf("[Partition %d][POS %lu] MERGING hash=%llu, key1=%d, key2=%d\n", partitionId, pos, p->hashValue, p->key[0], p->key[1]);
-                // PreAggregationHashtable::Entry* currCandidate = untag(ht[pos]);
-                PreAggregationHashtable::Entry* currCandidate;
-                do{
-                    currCandidate = reinterpret_cast<PreAggregationHashtable::Entry*>(atomicExch((unsigned long long*)&ht[pos], 1ull)); // global write, long scoreboards
+            const uint64_t candidateHash = candidate->hashValue;
+            bool merged = false;
+            while (currListNode){
+                // if full match -> merge partial aggregates
+                if (currListNode->hashValue == candidateHash && eqInt((uint8_t*)candidatePtr, (uint8_t*)currPtr)) {  
+                    combineInt((uint8_t*)candidatePtr, (uint8_t*)currPtr);
+                    merged = true;
+                    break;
                 }
-                while((unsigned long long)currCandidate == 1ull);
-
-                bool merged = false;
-                auto* currPtr = reinterpret_cast<GrowingBufEntryResHT*>(curr);
-                while (currCandidate) {
-                    auto* candidatePtr = reinterpret_cast<GrowingBufEntryResHT*>(currCandidate);
-                    if (currCandidate->hashValue == curr->hashValue && eqInt((uint8_t*)candidatePtr, (uint8_t*)currPtr)) { // Global loads, stalls, bad L2
-                        combineInt((uint8_t*)candidatePtr, (uint8_t*)currPtr); // bad L2
-                        merged = true;
-                        break;
-                    }
-                    currCandidate = currCandidate->next;
-                }
-                if (!merged) {
-                    PreAggregationHashtable::Entry* previousPtr = currCandidate;
-                    currCandidate = tag(curr, previousPtr, curr->hashValue);
-                    currCandidate = curr;
-                    curr->next = untag(previousPtr);
-                }
-                atomicExch((unsigned long long*)&ht[pos], (unsigned long long)currCandidate);
-                // if(atomicCAS((unsigned long long*)&ht[pos], 1ull, (unsigned long long)currCandidate) != 1ull){
-                    // printf("Trouble\n");
-                // }
+                currListNode = currListNode->next; // otherwise go to next
+            } 
+            if (!merged) { // if not merged, then it is a new aggregate, add it to pos by updating head
+                auto* taggedCandidate = tag(candidate, currHead, candidateHash); // Aggregate upper 16 bits of the bloom filter
+                candidate->next = untag(currHead); // candidate is the new head, CAN'T ACCESS TAGGED DATA!
+                currHead = taggedCandidate; 
             }
+            
+            unsigned long long x = atomicExch((unsigned long long*)&ht[pos], (unsigned long long)currHead); // release pos ownership by returning the head we have taken earlier
+            if(x != 1ull){ printf("Problems\n"); }
+            candidate = (PreAggregationHashtable::Entry*)myIterator.step();
         }
-
     }
-    // acquire_lock(&preAggrHT->mutex);
-    // // Append buffers that back partition's pointers (no invalidation, because buffer itself is not reallocated)
-    // preAggrHT->buffer.merge(localBuffer); 
-    // release_lock(&preAggrHT->mutex);
 }
 
 __global__ void freeKernel(GrowingBuffer* finalBuffer) {
     finalBuffer->~GrowingBuffer();
 }
 
-__global__ void freeFragments(PreAggregationHashtableFragmentSMEM* partitions, int numPartitions) {
-    for(int i = threadIdx.x; i < numPartitions; i+=blockDim.x){
-        partitions[i].~PreAggregationHashtableFragmentSMEM();
-    }
+__global__ void freeFragments(PreAggregationHashtableFragment* partition) {
+    partition->~PreAggregationHashtableFragment();
 }
+
+struct ViewResult{
+    GrowingBuffer* h_filter_scan{nullptr};
+    GrowingBuffer* d_filter_scan{nullptr}; 
+    HashIndexedView* h_hash_view{nullptr}; 
+    HashIndexedView* d_hash_view{nullptr};
+};
+
+template<TABLE Table>
+ViewResult buildView(int* filterCol, int* keyCol, int* valCol, int numTuples){
+    ViewResult res;
+    CHECK_CUDA_ERROR(cudaMallocHost(&res.h_filter_scan, sizeof(GrowingBuffer)));
+    CHECK_CUDA_ERROR(cudaMalloc(&res.d_filter_scan, sizeof(GrowingBuffer)));
+    CHECK_CUDA_ERROR(cudaMallocHost(&res.h_hash_view, sizeof(HashIndexedView)));
+    CHECK_CUDA_ERROR(cudaMalloc(&res.d_hash_view, sizeof(HashIndexedView)));
+    new(res.h_filter_scan) GrowingBuffer(TYPE_SIZE_SCAN);
+    CHECK_CUDA_ERROR(cudaMemcpy(res.d_filter_scan, res.h_filter_scan, sizeof(GrowingBuffer), cudaMemcpyHostToDevice));
+
+    // If you execute __syncthreads() to synchronize the threads of a block, it is recommended to have more than the achieved 1 blocks per multiprocessor. 
+    // This way, blocks that aren't waiting for __syncthreads() can keep the hardware busy
+    GrowingBuffer* locals;
+    int gridSize{30};
+    CHECK_CUDA_ERROR(cudaMalloc(&locals, sizeof(GrowingBuffer) * gridSize));
+    growingBufferFillTB<Table><<<gridSize,256>>>(filterCol, keyCol, valCol, numTuples, res.d_filter_scan, locals); 
+    cudaStreamSynchronize(0);
+    CHECK_CUDA_ERROR(cudaFree(locals));
+
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    CHECK_CUDA_ERROR(cudaMemcpy(res.h_filter_scan, res.d_filter_scan, sizeof(GrowingBuffer), cudaMemcpyDeviceToHost));
+    auto [htAllocSize, htMask] = getHtSizeMask(res.h_filter_scan->getValuesPtr()->getLen(), sizeof(GrowingBufEntryScan*));
+    std::cout << "Filter in: " << numTuples << ", filter out: " <<  res.h_filter_scan->getValuesPtr()->getLen() << "\n";
+    res.h_hash_view->htMask = htMask;
+    CHECK_CUDA_ERROR(cudaMalloc(&res.h_hash_view->ht, htAllocSize));
+    CHECK_CUDA_ERROR(cudaMemset(res.h_hash_view->ht, 0, htAllocSize));
+    CHECK_CUDA_ERROR(cudaMemcpy(res.d_hash_view, res.h_hash_view, sizeof(HashIndexedView), cudaMemcpyHostToDevice));
+    
+    buildHashIndexedViewSimple<<<30,256>>>(res.d_filter_scan, res.d_hash_view);
+    cudaStreamSynchronize(0);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+
+    return res;
+}
+
 
 float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, int* lo_revenue, int* lo_supplycost, int lo_len,
     int *d_datekey, int* d_year, int d_len,
@@ -712,54 +512,65 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         ViewResult dView = buildView<TABLE::D>(nullptr, d_datekey, d_year, d_len);
         std::cout << "** BUILT HASH VIEWS **" << std::endl;
         std::cout << "** BUILDING PREAGGREGATION FRAGMENTS **" << std::endl;
-        const size_t numFragments = 30;
-        const size_t numThreadsInBlockPreAggr = 1024;
-        PreAggregationHashtableFragmentSMEM* fragments_d;
-        PreAggregationHashtableFragmentSMEM* fragments_h;
-        CHECK_CUDA_ERROR(cudaMallocHost(&fragments_h, numFragments * sizeof(PreAggregationHashtableFragmentSMEM)));
-        CHECK_CUDA_ERROR(cudaMalloc(&fragments_d, numFragments * sizeof(PreAggregationHashtableFragmentSMEM)));
+        int numFragments = 20;
+        int  numThreadsInBlockPreAggr = 512; // 704 for gallatin
+        cudaOccupancyMaxPotentialBlockSize(&numFragments, &numThreadsInBlockPreAggr, buildPreAggregationHashtableFragments, 0, 0); 
+        std::cout << "<<<" << numFragments << ", " << numThreadsInBlockPreAggr << ">>>\n";
+        PreAggregationHashtableFragment* globalFragDevice;
+        CHECK_CUDA_ERROR(cudaMalloc(&globalFragDevice, sizeof(PreAggregationHashtableFragment)));
+
+        PreAggregationHashtableFragment* globalFragHost;
+        CHECK_CUDA_ERROR(cudaMallocHost(&globalFragHost, sizeof(PreAggregationHashtableFragment)));
+        new(globalFragHost) PreAggregationHashtableFragment(TYPE_SIZE_RES_HT);
+        CHECK_CUDA_ERROR(cudaMemcpy(globalFragDevice, globalFragHost, sizeof(PreAggregationHashtableFragment), cudaMemcpyHostToDevice)); 
+
+        PreAggregationHashtableFragment* localFragsDevice;
+        CHECK_CUDA_ERROR(cudaMalloc(&localFragsDevice, numFragments * sizeof(PreAggregationHashtableFragment)));
         // std::cout << "[buildPreAggregationHashtableFragments] Launch config: <<<" <<numBlocks << ","<<numThreadsInBlockPreAggr <<  ">>>\n";
-        buildPreAggregationHashtableFragmentsAdvanced<<<numFragments, numThreadsInBlockPreAggr>>>(
+
+        uint32_t availableSMEM = getSharedMemoryPerBlock(0);
+        int scracthPadShift{powerOfTwo(highestPowerOfTwo(availableSMEM)/sizeof(PreAggregationHashtableFragment::Entry*))};
+        uint64_t scracthPadSize{1 << scracthPadShift};
+        // std::cout << "availableSMEM=" << availableSMEM << ", scracthPadSize=" << scracthPadSize << "\n";
+        buildPreAggregationHashtableFragments<<<numFragments, numThreadsInBlockPreAggr,scracthPadSize,0>>>(
             lo_orderdate, lo_partkey, lo_custkey, lo_suppkey, lo_revenue, lo_supplycost, lo_len,
             sView.d_hash_view, cView.d_hash_view, pView.d_hash_view, dView.d_hash_view, 
-            fragments_d
+            scracthPadShift, globalFragDevice, localFragsDevice
         );
-        cudaDeviceSynchronize();
+        cudaStreamSynchronize(0);
+        CHECK_CUDA_ERROR(cudaFree(localFragsDevice));
         CHECK_CUDA_ERROR(cudaGetLastError());
 
         std::cout << "** BUILT PREAGGREGATION FRAGMENTS **" << std::endl;
         std::cout << "** MERGING PREAGGREGATION FRAGMENTS **" << std::endl;
 
-        CHECK_CUDA_ERROR(cudaMemcpy(fragments_h, fragments_d, numFragments * sizeof(PreAggregationHashtableFragmentSMEM), cudaMemcpyDeviceToHost)); // get sizes back
-        PreAggregationHashtable::PartitionHt* d_preAllocatedPartitions;
-        PreAggregationHashtable::PartitionHt* h_preAllocatedPartitions;
-        CHECK_CUDA_ERROR(cudaMalloc(&d_preAllocatedPartitions, sizeof(PreAggregationHashtable::PartitionHt) * 64));
-        CHECK_CUDA_ERROR(cudaMallocHost(&h_preAllocatedPartitions, sizeof(PreAggregationHashtable::PartitionHt) * 64));
+        CHECK_CUDA_ERROR(cudaMemcpy(globalFragHost, globalFragDevice, sizeof(PreAggregationHashtableFragment), cudaMemcpyDeviceToHost)); 
 
-        for(int partitionID = 0; partitionID < PreAggregationHashtableFragmentSMEM::numPartitions; partitionID++){
-            uint64_t partitionSize = 0;
-            for(int fragId = 0; fragId < numFragments; fragId++){
-                partitionSize += fragments_h[fragId].getPartitionPtr(partitionID)->getLen();
-            }
-            auto [htAllocSize, htMask] = getHtSizeMask(partitionSize, sizeof(PreAggregationHashtableFragmentSMEM::Entry*));
-            h_preAllocatedPartitions[partitionID].hashMask = htMask;
-            CHECK_CUDA_ERROR(cudaMalloc(&h_preAllocatedPartitions[partitionID].ht, htAllocSize));
-            CHECK_CUDA_ERROR(cudaMemset(h_preAllocatedPartitions[partitionID].ht, 0, htAllocSize));
+        PreAggregationHashtable::PartitionHt* preAllocatedPartitionsHost;
+        CHECK_CUDA_ERROR(cudaMallocHost(&preAllocatedPartitionsHost, sizeof(PreAggregationHashtable::PartitionHt) * PreAggregationHashtableFragment::numPartitions));
+
+        for(int partitionID = 0; partitionID < PreAggregationHashtableFragment::numPartitions; partitionID++){
+            uint64_t partitionSize = globalFragHost->getPartitionPtr(partitionID)->getLen();
+            auto [htAllocSize, htMask] = getHtSizeMask(partitionSize, sizeof(PreAggregationHashtableFragment::Entry*));
+            preAllocatedPartitionsHost[partitionID].hashMask = htMask;
+            CHECK_CUDA_ERROR(cudaMalloc(&preAllocatedPartitionsHost[partitionID].ht, htAllocSize));
+            CHECK_CUDA_ERROR(cudaMemset(preAllocatedPartitionsHost[partitionID].ht, 0, htAllocSize));
         }
-        // std::cout << "[Merge HT FRAGMENTS] Total size = " << totalSum << ", num fragments " << numFragments << "\n";
-        CHECK_CUDA_ERROR(cudaMemcpy(d_preAllocatedPartitions, h_preAllocatedPartitions, sizeof(PreAggregationHashtable::PartitionHt) * 64, cudaMemcpyHostToDevice));
         
-        PreAggregationHashtable* h_result_preAggrHT;
-        PreAggregationHashtable* d_result_preAggrHT;
-        CHECK_CUDA_ERROR(cudaMallocHost(&h_result_preAggrHT, sizeof(PreAggregationHashtable)));
-        CHECK_CUDA_ERROR(cudaMalloc(&d_result_preAggrHT, sizeof(PreAggregationHashtable)));
+        PreAggregationHashtable* preAggrHTDevice;
+        CHECK_CUDA_ERROR(cudaMalloc(&preAggrHTDevice, sizeof(PreAggregationHashtable)));
 
-        INITPreAggregationHashtableFragmentsSingleThread<<<1,1>>>(d_result_preAggrHT, d_preAllocatedPartitions);
-        mergePreAggregationHashtableFragments<<<64,512>>>(d_result_preAggrHT, d_preAllocatedPartitions, fragments_d, numFragments);
-        // printPreAggregationHashtable<<<1,1>>>(d_result_preAggrHT, false);
+        PreAggregationHashtable* preAggrHTHost;
+        CHECK_CUDA_ERROR(cudaMallocHost(&preAggrHTHost, sizeof(PreAggregationHashtable)));
+
+        new(preAggrHTHost) PreAggregationHashtable(preAllocatedPartitionsHost); // copies preAllocatedPartitionsDevice byte-by-byte
+        CHECK_CUDA_ERROR(cudaMemcpy(preAggrHTDevice, preAggrHTHost, sizeof(PreAggregationHashtable), cudaMemcpyHostToDevice)); 
+
+        mergePreAggregationHashtableFragments<<<PreAggregationHashtableFragment::numPartitions,256>>>(preAggrHTDevice, globalFragDevice);
+        cudaDeviceSynchronize();
+        printPreAggregationHashtable<<<1,1>>>(preAggrHTDevice, false);
         cudaDeviceSynchronize();
         CHECK_CUDA_ERROR(cudaGetLastError());
-
 
         std::cout << "** MERGED PREAGGREGATION FRAGMENTS **" << std::endl;
 
@@ -768,7 +579,7 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         freeKernel<<<1,1>>>(cView.d_filter_scan);
         freeKernel<<<1,1>>>(pView.d_filter_scan);
         freeKernel<<<1,1>>>(dView.d_filter_scan);
-        freeFragments<<<1,32>>>(fragments_d, numFragments);
+        freeFragments<<<1,1>>>(globalFragDevice);
         CHECK_CUDA_ERROR(cudaFree(sView.h_hash_view->ht));
         CHECK_CUDA_ERROR(cudaFree(cView.h_hash_view->ht));
         CHECK_CUDA_ERROR(cudaFree(pView.h_hash_view->ht));
@@ -777,17 +588,13 @@ float q41(int* lo_orderdate, int* lo_custkey, int* lo_partkey, int* lo_suppkey, 
         cudaDeviceSynchronize();
         CHECK_CUDA_ERROR(cudaGetLastError());
 
-        CHECK_CUDA_ERROR(cudaFreeHost(h_result_preAggrHT));
-        CHECK_CUDA_ERROR(cudaFree(d_result_preAggrHT));
+        CHECK_CUDA_ERROR(cudaFreeHost(preAggrHTHost));
+        CHECK_CUDA_ERROR(cudaFree(preAggrHTDevice));
         
-        CHECK_CUDA_ERROR(cudaFreeHost(h_preAllocatedPartitions));
-        CHECK_CUDA_ERROR(cudaFree(d_preAllocatedPartitions));
+        CHECK_CUDA_ERROR(cudaFreeHost(preAllocatedPartitionsHost));
 
-        CHECK_CUDA_ERROR(cudaFree(fragments_d));
-        CHECK_CUDA_ERROR(cudaFreeHost(fragments_h));
-
-        for(int outputId = 0; outputId < PreAggregationHashtableFragmentSMEM::numPartitions; outputId++){
-            CHECK_CUDA_ERROR(cudaFree(h_preAllocatedPartitions[outputId].ht));
+        for(int outputId = 0; outputId < PreAggregationHashtableFragment::numPartitions; outputId++){
+            CHECK_CUDA_ERROR(cudaFree(preAllocatedPartitionsHost[outputId].ht));
         }
 
         CHECK_CUDA_ERROR(cudaFree(sView.d_hash_view));

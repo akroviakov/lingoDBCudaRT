@@ -11,8 +11,6 @@ constexpr size_t GiB = 1024 * MiB;
 constexpr size_t HEAP_SIZE = 3 * GiB + 600 * MiB;
 
 constexpr int initialCapacity = INITIAL_CAPACITY;
-__device__ volatile int globalLock = 0;
-
 
 enum class MallocLevel{
     Thread = 0,
@@ -61,11 +59,6 @@ __device__ __forceinline__ void mergeThreadLocal(GrowingBuffer* myThreadLocalSta
 
 
 };
-
-__device__ int nearestPowerOfTwo(int value) {
-    if (value <= 0) return 0;
-    return 1 << (31 - __clz(value));  
-}
 
 template<MallocLevel OriginalLevel>
 __device__ __forceinline__ void mergeWarpLocal(GrowingBuffer* myWarpLocalState, MergeFn mergeFn) {

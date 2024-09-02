@@ -144,7 +144,7 @@ struct Vec {
         return reinterpret_cast<T*>(memAlloc(capacity * sizeof(T), COUNTER_NAME::MALLOC_VEC));
     }
 
-    __device__ Vec() : payLoad(nullptr), numElems(0), capacity(0) {}
+    __host__ __device__ Vec() : payLoad(nullptr), numElems(0), capacity(0) {}
     __device__ ~Vec() {} // should call destroy explicitly instead of relying on destructor!
     __device__ void destroy(){
         if(payLoad){
@@ -213,9 +213,8 @@ struct Vec {
 class FlexibleBuffer {
     Vec<Buffer> buffers;
     int32_t totalLen{0};
-    int32_t currCapacity{0};
+    int32_t currCapacity{16};
     int32_t typeSize{0};
-    int32_t lock{0};
 
     __device__ uint8_t* allocCurrentCapacity() {
         atomicAdd((unsigned long long*)&totallyAllocated, currCapacity * typeSize);
@@ -235,6 +234,7 @@ class FlexibleBuffer {
     }
 
 public:
+    int32_t lock{0};
 
     __device__ FlexibleBuffer(){}
     __host__ __device__ FlexibleBuffer(int32_t typeSize) : typeSize(typeSize) {}
@@ -292,8 +292,6 @@ public:
     }
 
     __device__ uint8_t* insert(const int32_t numElems){
-        // printf("buffers.size() = %d, buffers.back()= %p\n", buffers.size(),buffers.payLoad);
-
         if (buffers.size() == 0 || buffers.back().numElements + numElems >= currCapacity) {
             nextBuffer(numElems);
         }
@@ -320,7 +318,13 @@ public:
     __host__ __device__ int32_t getTypeSize() const { return typeSize; }
     __host__ __device__ int32_t getCapacity() const { return currCapacity; }
     __host__ __device__ Vec<Buffer>& getBuffers() { return buffers; }
-    __host__ __device__ void lateInit(int32_t newTypeSize, int32_t newCapacity) {typeSize = newTypeSize; currCapacity = newCapacity; }
+    __host__ __device__ void lateInit(int32_t newTypeSize, int32_t newCapacity) {
+        typeSize = newTypeSize; 
+        currCapacity = newCapacity; 
+        new(&buffers) Vec<Buffer>();
+        totalLen=0;
+        lock=0;
+    }
 
     __device__ void print(void (*printEntry)(uint8_t*) = nullptr){
         printf("--------------------FlexibleBuffer [%p]--------------------\n", this);
@@ -358,25 +362,30 @@ public:
     __device__ uint8_t* initialize() { // Given start, find position across buffers
         int32_t numBuffers = parent->getBuffers().size();
         int32_t remaining = start;
+        uint8_t* res{nullptr};
         for (bufferIndex = 0; bufferIndex < numBuffers; ++bufferIndex) {
             if (remaining < parent->getBuffers()[bufferIndex].numElements) {
                 localIndex = remaining;
-                return currentPointer();
+                res = currentPointer();
+                break;
             }
             remaining -= parent->getBuffers()[bufferIndex].numElements;
         }
-        return nullptr; 
+        return res; 
     }
 
     __device__ uint8_t* step() {
         int32_t numBuffers = parent->getBuffers().size();
-        if (bufferIndex >= numBuffers) return nullptr;
-        localIndex += stride;
-        while (bufferIndex < numBuffers && localIndex >= parent->getBuffers()[bufferIndex].numElements) {
-            localIndex -= parent->getBuffers()[bufferIndex].numElements;
-            bufferIndex++;
+        uint8_t* res{nullptr};
+        if (bufferIndex < numBuffers){
+            localIndex += stride;
+            while (bufferIndex < numBuffers && localIndex >= parent->getBuffers()[bufferIndex].numElements) {
+                localIndex -= parent->getBuffers()[bufferIndex].numElements;
+                bufferIndex++;
+            }
+            res = currentPointer();
         }
-        return currentPointer();
+        return res;
     }
 };
 #endif // FLEXIBLEBUFFER_H
