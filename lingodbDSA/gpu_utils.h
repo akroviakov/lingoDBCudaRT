@@ -38,8 +38,30 @@ __device__ int nearestPowerOfTwo(int value) {
 __device__ __forceinline__ void prefetch_l2(const void *p) {asm("prefetch.global.L2 [%0];" : : "l"(p));}
 __device__ __forceinline__ void prefetch_l1(const void *p) {asm("prefetch.global.L1 [%0];" : : "l"(p));}
 
-__device__ __forceinline__ int uncachedReadCS(int* ptr) {
+__device__ __forceinline__ int streamingRead(int* ptr) {
     int value;
     asm volatile("ld.cs.b32 %0, [%1];" : "=r"(value) : "l"(ptr));
     return value;
+}
+
+__device__ __forceinline__ int readCacheOnlyL2(int* ptr) {
+    int value;
+    asm volatile("ld.cg.b32 %0, [%1];" : "=r"(value) : "l"(ptr));
+    return value;
+}
+
+enum ReadCacheMode {
+  PERSIST = 0,
+  PERSIST_L2,
+  STREAM
+};
+
+template<ReadCacheMode Mode>
+__device__ __forceinline__ int readAs(int *p) {
+  if constexpr(Mode == ReadCacheMode::STREAM)
+    return streamingRead(p);
+  else if constexpr(Mode == ReadCacheMode::PERSIST_L2)
+    return readCacheOnlyL2(p);
+  else 
+    return *p;
 }

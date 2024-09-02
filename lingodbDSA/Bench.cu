@@ -269,28 +269,28 @@ __global__ void buildPreAggregationHashtableFragments(
             ////// PROBE S JOIN CONDITION //////
             const int lo_key_S = lo_suppkey[probeColTupleIdx];
             const uint64_t hash_S = hashInt32ToInt64(lo_key_S);
-            const size_t pos_S = hash_S & sView->htMask;
+            const uint64_t pos_S = hash_S & sView->htMask;
             GrowingBufEntryScan* current_S = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(sView->ht[pos_S], hash_S, bloomMasks)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
             while(current_S){ 
                 if (current_S->hashValue == hash_S && current_S->key == lo_key_S) { // STALLS!
                     ////// PROBE C JOIN CONDITION //////
                     const int lo_key_C = lo_custkey[probeColTupleIdx];
                     const uint64_t hash_C = hashInt32ToInt64(lo_key_C);
-                    const size_t pos_C = hash_C & cView->htMask;
+                    const uint64_t pos_C = hash_C & cView->htMask;
                     current_C = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(cView->ht[pos_C], hash_C, bloomMasks)); // we have one view here (can have more in case of joins) // Global load (uncoalesced)
                     while(current_C){ 
                         if (current_C->hashValue == hash_C && current_C->key == lo_key_C) {
                             ////// PROBE P JOIN CONDITION //////
                             const int lo_key_P = lo_partkey[probeColTupleIdx];
                             const uint64_t hash_P = hashInt32ToInt64(lo_key_P);
-                            const size_t pos_P = hash_P & pView->htMask;
+                            const uint64_t pos_P = hash_P & pView->htMask;
                             GrowingBufEntryScan* current_P = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(pView->ht[pos_P], hash_P, bloomMasks));
                             while(current_P){
                                 if (current_P->hashValue == hash_P && current_P->key == lo_key_P) {
                                     ////// PROBE D JOIN CONDITION //////
                                     const int lo_key_D = lo_orderdate[probeColTupleIdx];
                                     const uint64_t hash_D = hashInt32ToInt64(lo_key_D);
-                                    const size_t pos_D = hash_D & dView->htMask;
+                                    const uint64_t pos_D = hash_D & dView->htMask;
                                     current_D = reinterpret_cast<GrowingBufEntryScan*>(filterTagged(dView->ht[pos_D], hash_D, bloomMasks));
                                     while(current_D){
                                         if(current_D->hashValue == hash_D && current_D->key == lo_key_D){
@@ -339,11 +339,11 @@ __global__ void buildPreAggregationHashtableFragments(
                 }
             }
         }
-        // int mask = __ballot_sync(0xFFFFFFFF, foundMatch && needInsert);
+        int mask = __ballot_sync(0xFFFFFFFF, foundMatch && needInsert);
         if(foundMatch){
-            int64_t value = uncachedReadCS(&lo_revenue[probeColTupleIdx]) - uncachedReadCS(&lo_supplycost[probeColTupleIdx]);
+            int64_t value = lo_revenue[probeColTupleIdx] - lo_supplycost[probeColTupleIdx];
             if(needInsert){
-                GrowingBufEntryResHT* myEntry = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->insertWarpOpportunistic(hashGroupCols));
+                GrowingBufEntryResHT* myEntry = reinterpret_cast<GrowingBufEntryResHT*>(myFrag->insertWarp(hashGroupCols, mask));
                 myEntry->hashValue = hashGroupCols;
                 myEntry->key[0] = current_D->value;
                 myEntry->key[1] = current_C->value;

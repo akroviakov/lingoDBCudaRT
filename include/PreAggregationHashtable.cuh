@@ -38,8 +38,11 @@ class PreAggregationHashtableFragment {
     __host__ __device__ __forceinline__ FlexibleBuffer* getPartitionPtr(int partitionID) {return &partitions[partitionID];} 
 
     __device__ __forceinline__ Entry* insertWarpOpportunistic(const uint64_t hash) {
+        return insertWarp(hash, __activemask());
+    }
+    __device__ __forceinline__ Entry* insertWarp(const uint64_t hash, int maske) {
         const int partitionID = hash & partitionMask;
-        const int mask{__match_any_sync(__activemask(), partitionID)};
+        const int mask{__match_any_sync(maske, partitionID)};
         const int numWriters{__popc(mask)};
         const int leader{__ffs(mask)-1};
         const int lane{threadIdx.x % warpSize};

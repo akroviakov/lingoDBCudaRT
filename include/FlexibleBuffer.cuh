@@ -213,7 +213,7 @@ struct Vec {
 class FlexibleBuffer {
     Vec<Buffer> buffers;
     int32_t totalLen{0};
-    int32_t currCapacity{16};
+    int32_t currCapacity{128};
     int32_t typeSize{0};
 
     __device__ uint8_t* allocCurrentCapacity() {

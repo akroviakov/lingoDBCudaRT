@@ -3,6 +3,7 @@
 #include "PrefixSum.cuh"
 #include "lock.cuh"
 #include "util.h"
+#include "gpu_utils.h"
 #include <assert.h>
 
 constexpr size_t KiB = 1024;
