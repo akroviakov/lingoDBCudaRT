@@ -134,7 +134,12 @@ def plot_barplot_bytes_with_baseline(filename, plot_dir):
 
     max_num_rows = grouped_df['Num rows'].max()
     max_selectivity = grouped_df['Selectivity'].max()
-    grouped_df = grouped_df[(grouped_df['Num rows'] == max_num_rows) & (grouped_df['Selectivity'] == max_selectivity)]
+    max_blk = grouped_df['Block Size'].max()
+    max_grid = grouped_df['Grid Size'].max()
+    grouped_df = grouped_df[(grouped_df['Num rows'] == max_num_rows) & 
+                            (grouped_df['Selectivity'] == max_selectivity) &
+                            (grouped_df['Block Size'] == max_blk) &
+                            (grouped_df['Grid Size'] == max_grid)]
     min_time_df = grouped_df.loc[grouped_df.groupby('Locality Level')['Kernel Time (ms)'].idxmin()]
 
     kernel_types = min_time_df['Locality Level']

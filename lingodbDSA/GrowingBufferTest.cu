@@ -46,19 +46,6 @@ __device__ __forceinline__ void mergeThreadLocal(GrowingBuffer* myThreadLocalSta
         }
     }
     __syncthreads(); // all warps must be done
-
-    // __syncthreads();
-
-    //     for (int offset = 0; offset < 32; offset++) { 
-    //         if(warpLaneIdx == 0){
-    //             mergeFn(myThreadLocalState, &myThreadLocalState[offset]);
-    //         }
-    //     __syncthreads();
-    //     }
-    
-    // __syncthreads();
-
-
 };
 
 template<MallocLevel OriginalLevel>
@@ -102,6 +89,100 @@ __device__ __forceinline__ int64_t hashInt32ToInt64(int32_t x) {
     result ^= (result >> 31);
     result = result & 0xFFFFFFFFFFFFFFFF;
     return static_cast<int64_t>(result);
+}
+
+template<MallocLevel Level = MallocLevel::Thread>
+__global__ void fillGrowingBufferSMEM(int** inputCols, int numCols, int numRows, int filterColId, int keyColId, int valColId, int LTPredicate, GrowingBuffer* finalBuffer, GrowingBuffer* locals) {
+    const int laneId = threadIdx.x % warpSize;
+    const int globalTID = blockDim.x * blockIdx.x + threadIdx.x;
+    const int globalWarpID = globalTID / warpSize;
+    int* keyCol = inputCols[keyColId];
+    int* valCol = inputCols[valColId];
+    int* filterCol = inputCols[filterColId];
+    __shared__ char tbCursorAndCounter[sizeof(GrowingBuffer) * 1024 + sizeof(GrowingBufEntryScan*) + sizeof(int)];
+    GrowingBuffer* buffers = reinterpret_cast<GrowingBuffer*>(tbCursorAndCounter);
+    GrowingBufEntryScan** cursor = reinterpret_cast<GrowingBufEntryScan**>(&buffers[1024]);
+    int* counter = reinterpret_cast<int*>(&cursor[1]);
+    GrowingBuffer* myBuffer;
+    if constexpr(Level == MallocLevel::Thread){
+        myBuffer = reinterpret_cast<GrowingBuffer*>(&buffers[threadIdx.x]);
+    } else if constexpr(Level == MallocLevel::Warp){
+        myBuffer = reinterpret_cast<GrowingBuffer*>(&buffers[threadIdx.x/warpSize]);
+    } else {
+        myBuffer = reinterpret_cast<GrowingBuffer*>(&buffers[0]);
+        if(threadIdx.x == 0){ *counter=0; }
+    }
+
+    if constexpr(Level == MallocLevel::Thread){
+        new(myBuffer) GrowingBuffer(min(256, max(8,nearestPowerOfTwo(numRows / (blockDim.x * gridDim.x)))), typeSize);
+    } else if constexpr(Level == MallocLevel::Warp){
+        if(laneId == 0){
+            new(myBuffer) GrowingBuffer(min(256 * 4, max(32,nearestPowerOfTwo(numRows / ((blockDim.x / 32) * gridDim.x)))), typeSize);
+        }
+        __syncwarp();
+    } else {
+        if(threadIdx.x == 0){
+            new(myBuffer) GrowingBuffer(min(256 * 4 * 2, max(8,nearestPowerOfTwo(numRows / gridDim.x))), typeSize);
+        }
+        __syncthreads();
+    }
+    const int numThreadsTotal = blockDim.x * gridDim.x;
+    int numRowsRounded = ((numRows + (warpSize-1)) / warpSize) * warpSize;
+    GrowingBufEntryScan* writeCursor;
+    for (int i = globalTID; i < numRowsRounded; i += numThreadsTotal) {
+        int pred = i < numRows;
+        if (pred) { 
+            pred &= (filterCol[i] < LTPredicate);
+            if(pred){
+                if constexpr(Level == MallocLevel::Thread){
+                    writeCursor = (GrowingBufEntryScan*)myBuffer->insert(1);
+                } else if constexpr(Level == MallocLevel::Warp){
+                    writeCursor = (GrowingBufEntryScan*)myBuffer->getValuesPtr()->insertWarpLevelOpportunistic(); 
+                }
+                if constexpr(Level != MallocLevel::ThreadBlock){
+                    writeCursor->key = keyCol[i]; 
+                    writeCursor->hashValue = hashInt32ToInt64(keyCol[i]); 
+                    writeCursor->value = valCol[i]; 
+                }
+            }
+        } 
+        if constexpr(Level == MallocLevel::ThreadBlock){
+            int threadOffset = 0;
+            const int maskWriters = __ballot_sync(__activemask(), pred);
+            const int leader = __ffs(maskWriters)-1;
+            if(laneId == leader){
+                threadOffset = atomicAdd_block(counter, __popc(maskWriters)); 
+            }
+            threadOffset = __shfl_sync(maskWriters, threadOffset, leader) + __popc(maskWriters & ((1U << laneId) - 1)); 
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                *cursor = (GrowingBufEntryScan*)myBuffer->insert(*counter);
+                *counter = 0;
+            }
+            __syncthreads();
+            writeCursor = *cursor;
+            if(pred){
+                writeCursor[threadOffset].key = keyCol[i]; 
+                writeCursor[threadOffset].hashValue = hashInt32ToInt64(keyCol[i]); 
+                writeCursor[threadOffset].value = valCol[i]; 
+            }
+        }
+    }
+
+    if constexpr(Level == MallocLevel::Thread){
+        mergeThreadLocal(myBuffer, mergeToLeft);
+    }
+
+    if constexpr(Level == MallocLevel::Warp || Level == MallocLevel::Thread){
+        mergeWarpLocal<Level>(myBuffer, mergeToLeft);
+    } 
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        finalBuffer->getValuesPtr()->acqLock(); // "global" lock
+        mergeToLeft(finalBuffer, myBuffer);
+        finalBuffer->getValuesPtr()->relLock();
+    }
 }
 
 
