@@ -33,8 +33,11 @@ def plot_time_vs_selectivity_per_data_size(filename, plot_dir):
     df = pd.read_csv(filename)
     grouped_df = df.groupby(['Version', 'Locality Level', 'Num rows', 'Selectivity', 'Grid Size', 'Block Size']).mean().reset_index()
     minimal_time_df = grouped_df.loc[grouped_df.groupby(['Version', 'Locality Level', 'Num rows', 'Selectivity'])['Kernel Time (ms)'].idxmin()]
+
+    minimal_time_df = minimal_time_df[minimal_time_df['Num rows'] == minimal_time_df['Num rows'].max()] 
+
     unique_num_rows = minimal_time_df['Num rows'].unique()
-    
+
     fig, axes = plt.subplots(len(unique_num_rows), 1, figsize=(6, 3 * len(unique_num_rows)), sharex=True)
     if len(unique_num_rows) > 1:
         axes = axes.flatten()
@@ -78,9 +81,12 @@ def plot_time_vs_data_size_per_selectivity(filename, plot_dir):
     df = pd.read_csv(filename)
     grouped_df = df.groupby(['Version', 'Locality Level', 'Num rows', 'Selectivity', 'Grid Size', 'Block Size']).mean().reset_index()
     minimal_time_df = grouped_df.loc[grouped_df.groupby(['Version', 'Locality Level', 'Num rows', 'Selectivity'])['Kernel Time (ms)'].idxmin()]
+
+    minimal_time_df = minimal_time_df[minimal_time_df['Selectivity'] == minimal_time_df['Selectivity'].max()] 
+
     unique_selectivities = minimal_time_df['Selectivity'].unique()
     
-    fig, axes = plt.subplots(len(unique_selectivities), 1, figsize=(12, 6 * len(unique_selectivities)), sharex=True)
+    fig, axes = plt.subplots(len(unique_selectivities), 1, figsize=(6, 3 * len(unique_selectivities)), sharex=True)
     if len(unique_selectivities) > 1:
         axes = axes.flatten()
     else:
@@ -168,7 +174,7 @@ def plot_barplot_malloc_count(filename, plot_dir):
 
 
     fig, ax = plt.subplots(figsize=(5, 3))
-    # ax.set_yscale('log')
+    ax.set_yscale('log')
     ax.bar(kernel_types, malloc_count_buffer, 
                    color="red", hatch=hatch_patterns[0], 
                    edgecolor='black',
