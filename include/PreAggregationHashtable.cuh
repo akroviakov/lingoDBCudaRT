@@ -49,9 +49,9 @@ class PreAggregationHashtableFragment {
         FlexibleBuffer* targetPartition = &partitions[partitionID];
         Entry* newEntry{nullptr};
         if(lane == leader){
-            targetPartition->acqLock();
+            targetPartition->acqLockBlock();
             newEntry = reinterpret_cast<Entry*>(targetPartition->insert(numWriters));
-            targetPartition->relLock();
+            targetPartition->relLockBlock();
         }
         if(numWriters > 1){
             const int laneOffset = __popc(mask & ((1U << lane) - 1));

@@ -19,9 +19,18 @@ __device__ void acquireLock(int32_t* lock) {
     while (atomicCAS(lock, 0, 1) != 0);
     __threadfence(); 
 }
+__device__ void acquireLockBlock(int32_t* lock) {
+    while (atomicCAS(lock, 0, 1) != 0);
+    __threadfence_block(); 
+}
+
 
 __device__ void releaseLock(int32_t* lock) {
     __threadfence();
+    atomicExch(lock, 0); 
+}
+__device__ void releaseLockBlock(int32_t* lock) {
+    __threadfence_block();
     atomicExch(lock, 0); 
 }
 #endif // LOCK_H

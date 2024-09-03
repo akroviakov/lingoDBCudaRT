@@ -265,9 +265,14 @@ public:
     __device__ void acqLock(){
         acquireLock(&lock);
     }    
-
+    __device__ void acqLockBlock(){
+        acquireLockBlock(&lock);
+    }    
     __device__ void relLock(){
         releaseLock(&lock);
+    }
+    __device__ void relLockBlock(){
+        releaseLockBlock(&lock);
     }
 
     __device__ uint8_t* insertWarpLevelOpportunistic(){
@@ -278,9 +283,9 @@ public:
         const int lane{threadIdx.x % warpSize};
         if(lane == leader){
             // A warp can diverge, so sub-warps will share the the warp-level data structure, ensure the lock is initialized.
-            acqLock();
+            acqLockBlock();
             res = insert(numWriters);
-            relLock();
+            relLockBlock();
         }
         
         if(numWriters > 1){
