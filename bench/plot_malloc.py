@@ -54,7 +54,7 @@ def plot_time_vs_selectivity_per_data_size(filename, plot_dir):
         prefix_sum_df = subset[subset['Locality Level'] == 'PrefixSum']
         if not prefix_sum_df.empty:
             ax.plot(prefix_sum_df['Selectivity'], prefix_sum_df['Kernel Time (ms)'], 
-                    color='red', linestyle='-', marker='o', 
+                    color='red', linestyle='-', marker='',
                     label='PrefixSum', linewidth=2)
 
         for (version, locality), group in subset.groupby(['Version', 'Locality Level']):
@@ -65,7 +65,6 @@ def plot_time_vs_selectivity_per_data_size(filename, plot_dir):
             ax.plot(group['Selectivity'], group['Kernel Time (ms)'], 
                     marker='X', color=color, linestyle=style, 
                     label=f'{version}::{locality}')
-
         ax.legend(loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
         ax.set_title(f'Num rows: {num_rows}')
         ax.set_ylabel('Kernel Time (ms)')
@@ -146,13 +145,15 @@ def plot_barplot_bytes_with_baseline(filename, plot_dir):
     allocated_bytes = min_time_df['AllocatedResultBytes']
     true_bytes = min_time_df['TrueResultBytes'].mean()  # Assuming the same value for 'TrueResultBytes' across all rows
     fig, ax = plt.subplots(figsize=(8, 6))
-    ax.bar(kernel_types, allocated_bytes, color='steelblue', edgecolor='black', label='Allocated Result Bytes')
+    ax.set_yscale('log')
+    ax.grid(True, zorder=0)
+    ax.set_ylim(0, allocated_bytes.max() * 10)
+    ax.bar(kernel_types, allocated_bytes, color='steelblue', edgecolor='black', label='Allocated Result Bytes',zorder=3)
     ax.axhline(y=true_bytes, color='red', linestyle='--', label='True Result Bytes (Ground Truth)')
     ax.set_ylabel('Result Bytes')
     ax.legend()
     ax.set_xticks(kernel_types)
     ax.set_xticklabels(kernel_types, ha='right')
-
     fig.tight_layout()
     fig.savefig(f"{plot_dir}/barplot_result_bytes.png", dpi=300)
     fig.savefig(f"{plot_dir}/barplot_result_bytes.pdf", dpi=300)
@@ -180,16 +181,19 @@ def plot_barplot_malloc_count(filename, plot_dir):
 
     fig, ax = plt.subplots(figsize=(5, 3))
     ax.set_yscale('log')
+    ax.grid(True, zorder=0)
+    ax.set_ylim(0, (malloc_count_buffer.max() + malloc_count_vec.max()) * 3)
     ax.bar(kernel_types, malloc_count_buffer, 
-                   color="red", hatch=hatch_patterns[0], 
-                   edgecolor='black',
-                   label='Malloc Count (buffer)')
+        color="red", hatch=hatch_patterns[0], 
+        edgecolor='black',
+        label='Malloc Count (buffer)',
+        zorder=3)  # Ensures bars are above gridlines
     ax.bar(kernel_types, malloc_count_vec, 
-                   color="steelblue", hatch=hatch_patterns[1], 
-                   edgecolor='black',
-                   bottom=malloc_count_buffer, 
-                   label='Malloc Count (Vec)')
-    
+        color="steelblue", hatch=hatch_patterns[1], 
+        edgecolor='black',
+        bottom=malloc_count_buffer, 
+        label='Malloc Count (Vec)',
+        zorder=3)  # Ensures bars are above gridlines
     ax.set_ylabel('# of malloc() calls')
     # ax.set_xlabel('Kernel type')
     # ax.set_title('Malloc calls for different kernel versions')
