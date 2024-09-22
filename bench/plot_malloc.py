@@ -8,7 +8,7 @@ import argparse
 CURR_DIR = os.path.dirname(os.path.abspath(__file__))
 byte_order = ['bytes', 'KB', 'MB', 'GB']
 linestyles = ['-', '--', ':', '-.'] 
-discrete_colors = ['blue', 'green', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan'] # 'red'
+discrete_colors = ['#0072B2', '#D55E00', '#56B4E9', '#009E73', '#F0E442', '#E69F00', '#CC79A7', '#000000']
 hatch_patterns = ['/', '+', 'o', '\\', '|', '-', '+', 'x', 'o', 'O', '.', '*']
 
 def bytes_to_human_readable(num_bytes):
@@ -148,7 +148,7 @@ def plot_barplot_bytes_with_baseline(filename, plot_dir):
     ax.set_yscale('log')
     ax.grid(True, zorder=0)
     ax.set_ylim(0, allocated_bytes.max() * 10)
-    ax.bar(kernel_types, allocated_bytes, color='steelblue', edgecolor='black', label='Allocated Result Bytes',zorder=3)
+    ax.bar(kernel_types, allocated_bytes, color=discrete_colors[0], edgecolor='black', label='Allocated Result Bytes',zorder=3)
     ax.axhline(y=true_bytes, color='red', linestyle='--', label='True Result Bytes (Ground Truth)')
     ax.set_ylabel('Result Bytes')
     ax.legend()
@@ -184,12 +184,12 @@ def plot_barplot_malloc_count(filename, plot_dir):
     ax.grid(True, zorder=0)
     ax.set_ylim(0, (malloc_count_buffer.max() + malloc_count_vec.max()) * 3)
     ax.bar(kernel_types, malloc_count_buffer, 
-        color="red", hatch=hatch_patterns[0], 
+        color=discrete_colors[0], hatch=hatch_patterns[0], 
         edgecolor='black',
         label='Malloc Count (buffer)',
         zorder=3)  # Ensures bars are above gridlines
     ax.bar(kernel_types, malloc_count_vec, 
-        color="steelblue", hatch=hatch_patterns[1], 
+        color=discrete_colors[1], hatch=hatch_patterns[1], 
         edgecolor='black',
         bottom=malloc_count_buffer, 
         label='Malloc Count (Vec)',
