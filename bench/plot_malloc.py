@@ -164,6 +164,8 @@ def plot_barplot_malloc_count(filename, plot_dir):
     grouped_df = df.groupby(['Version', 'Locality Level', 'Num rows', 'Selectivity', 'Grid Size', 'Block Size']).mean().reset_index()
     grouped_df = grouped_df[grouped_df["Version"] == "Baseline"]
     grouped_df = grouped_df[grouped_df['Locality Level'] != "PrefixSum"]
+    locality_order = pd.Categorical(grouped_df['Locality Level'], categories=['Thread', 'Warp', 'ThreadBlock'], ordered=True)
+    grouped_df = grouped_df.sort_values(by='Locality Level', key=lambda col: locality_order)
 
     max_num_rows = grouped_df['Num rows'].max()
     max_selectivity = grouped_df['Selectivity'].max()
